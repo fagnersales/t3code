@@ -640,6 +640,12 @@ interface ComposerDraftStoreState {
     options?: { allowDuplicates?: boolean },
   ) => string[];
   removeImage: (threadRef: ComposerThreadTarget, imageId: string) => void;
+  /** Swaps an image's bytes in place, keeping its id, position and prompt references. */
+  replaceImage: (
+    threadRef: ComposerThreadTarget,
+    imageId: string,
+    image: ComposerImageAttachment,
+  ) => boolean;
   /** Returns the ids of files appended; a re-pick that replaces a marker is not listed. */
   addFiles: (
     threadRef: ComposerThreadTarget,
@@ -3514,6 +3520,34 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
             }
             return { draftsByThreadKey: nextDraftsByThreadKey };
           });
+        },
+        replaceImage: (threadRef, imageId, image) => {
+          const threadKey = resolveComposerDraftKey(get(), threadRef) ?? "";
+          const existing = threadKey.length > 0 ? get().draftsByThreadKey[threadKey] : undefined;
+          const replacedImage = existing?.images.find((candidate) => candidate.id === imageId);
+          if (!existing || !replacedImage) {
+            revokeObjectPreviewUrl(image.previewUrl);
+            return false;
+          }
+          revokeObjectPreviewUrl(replacedImage.previewUrl);
+          set((state) => {
+            const current = state.draftsByThreadKey[threadKey];
+            if (!current) {
+              return state;
+            }
+            return {
+              draftsByThreadKey: {
+                ...state.draftsByThreadKey,
+                [threadKey]: {
+                  ...current,
+                  images: current.images.map((candidate) =>
+                    candidate.id === imageId ? { ...image, id: imageId } : candidate,
+                  ),
+                },
+              },
+            };
+          });
+          return true;
         },
         addFiles: (threadRef, files, options) => {
           const threadKey = resolveComposerDraftKey(get(), threadRef) ?? "";

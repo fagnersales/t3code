@@ -3351,6 +3351,25 @@ describe("composerDraftStore attachment references", () => {
     expect(draftFor(threadId, TEST_ENVIRONMENT_ID)?.prompt).toBe("see and ok");
   });
 
+  it("replaces an edited image in place, keeping its id, position and references", () => {
+    const store = useComposerDraftStore.getState();
+    store.setPrompt(threadRef, `see ${imageLink} ok`);
+    store.addImages(threadRef, [
+      makeImage({ id: "img-1", previewUrl: "blob:img-1", name: "shot.png" }),
+      makeImage({ id: "img-2", previewUrl: "blob:img-2", name: "other.png", sizeBytes: 8 }),
+    ]);
+    const edited = makeImage({ id: "edited", previewUrl: "blob:edited", sizeBytes: 16 });
+    expect(store.replaceImage(threadRef, "img-1", edited)).toBe(true);
+    const draft = draftFor(threadId, TEST_ENVIRONMENT_ID);
+    expect(draft?.images.map((image) => [image.id, image.previewUrl])).toEqual([
+      ["img-1", "blob:edited"],
+      ["img-2", "blob:img-2"],
+    ]);
+    expect(draft?.images[0]?.file).toBe(edited.file);
+    expect(draft?.prompt).toBe(`see ${imageLink} ok`);
+    expect(store.replaceImage(threadRef, "missing", edited)).toBe(false);
+  });
+
   it("moves a needs-reattach marker's chip to the re-picked file", () => {
     const store = useComposerDraftStore.getState();
     store.setPrompt(threadRef, "see [notes.txt](t3-context://v1/file/file_marker-1) ok");

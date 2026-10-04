@@ -33,6 +33,13 @@ Pending captures are kept on disk until the attachment is saved to the draft, so
 closing the app mid-way and is attached on the next launch. Captures rejected because the image is
 too large are discarded.
 
+## Marking up a capture
+
+Hover an attached image in the draft and select the pencil to draw on it, add arrows and boxes, or
+type text. **Done** replaces the attachment with the marked-up image; the marks cannot be removed
+afterwards, so remove and recapture to start over. This works for any image attached to a draft, not
+only SnapShots.
+
 ## Changing the shortcut
 
 Select the shortcut in Settings, press the new keys, then **Save**. On macOS and Windows you can use

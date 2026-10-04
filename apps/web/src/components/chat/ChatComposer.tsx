@@ -262,6 +262,8 @@ import {
 import { ComposerPendingApprovalActions } from "./ComposerPendingApprovalActions";
 import { CompactComposerControlsMenu } from "./CompactComposerControlsMenu";
 import { ComposerImageThumbnail } from "./ComposerImageThumbnail";
+import { ImageAnnotationDialog } from "./ImageAnnotationDialog";
+import { pngFileName } from "./imageAnnotations";
 import { ComposerPrimaryActions } from "./ComposerPrimaryActions";
 import { ComposerPendingApprovalPanel } from "./ComposerPendingApprovalPanel";
 import { ComposerPendingUserInputPanel } from "./ComposerPendingUserInputPanel";
@@ -1077,6 +1079,7 @@ import {
   BotIcon,
   CircleAlertIcon,
   PaperclipIcon,
+  PencilIcon,
   PencilRulerIcon,
   PlayIcon,
   ShieldIcon,
@@ -1956,6 +1959,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const setComposerDraftPrompt = useComposerDraftStore((store) => store.setPrompt);
   const addComposerDraftImages = useComposerDraftStore((store) => store.addImages);
   const removeComposerDraftImage = useComposerDraftStore((store) => store.removeImage);
+  const replaceComposerDraftImage = useComposerDraftStore((store) => store.replaceImage);
   const addComposerDraftFiles = useComposerDraftStore((store) => store.addFiles);
   const removeComposerDraftFile = useComposerDraftStore((store) => store.removeFile);
   const setComposerDraftFileUpload = useComposerDraftStore((store) => store.setFileUpload);
@@ -3013,6 +3017,38 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       }),
     [addComposerDraftFiles, attachmentDraftTarget, questionAttachmentTarget],
   );
+
+  const [annotatingImageId, setAnnotatingImageId] = useState<string | null>(null);
+  const annotatingImage = annotatingImageId
+    ? composerImages.find((image) => image.id === annotatingImageId)
+    : undefined;
+  const closeImageAnnotation = () => setAnnotatingImageId(null);
+  const saveImageAnnotation = async (imageId: string, blob: Blob) => {
+    const image = composerImagesRef.current.find((candidate) => candidate.id === imageId);
+    if (!image) {
+      setAnnotatingImageId(null);
+      return;
+    }
+    const prepared = await prepareImageForAttachment(
+      new File([blob], pngFileName(image.name), { type: blob.type }),
+      PROVIDER_SEND_TURN_MAX_IMAGE_BYTES,
+    );
+    if (!prepared.ok) {
+      throw new Error("The edited image is too large to attach.");
+    }
+    // The old bytes may already be uploaded; drop them so the edited file uploads in their place.
+    releaseAttachmentUpload(imageId);
+    replaceComposerDraftImage(attachmentDraftTarget, imageId, {
+      ...image,
+      name: prepared.file.name,
+      mimeType: prepared.file.type,
+      sizeBytes: prepared.file.size,
+      previewUrl: URL.createObjectURL(prepared.file),
+      file: prepared.file,
+      ...(image.source ? { source: resizeSnapShotSource(image.source, prepared.imageSize) } : {}),
+    });
+    setAnnotatingImageId(null);
+  };
 
   const removeComposerImageFromDraft = useCallback(
     (imageId: string) => {
@@ -7080,14 +7116,24 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                                 <TooltipPopup side="top">{upload.reason}</TooltipPopup>
                               </Tooltip>
                             )}
-                            {/* Snap-shot frames reveal their remove button on hover or focus. */}
+                            {/* Snap-shot frames reveal their edit and remove buttons on hover or focus. */}
                             <span
                               className={cn(
-                                "absolute right-1 top-1 flex",
+                                "absolute right-1 top-1 flex gap-1",
                                 image.source?.kind === "snap-shot" &&
                                   "opacity-0 transition-opacity pointer-coarse:opacity-100 group-hover/attachment:opacity-100 group-focus-within/attachment:opacity-100",
                               )}
                             >
+                              {image.previewUrl ? (
+                                <Button
+                                  variant="media-close"
+                                  size="icon-xs"
+                                  onClick={() => setAnnotatingImageId(image.id)}
+                                  aria-label={`Edit ${image.name}`}
+                                >
+                                  <PencilIcon />
+                                </Button>
+                              ) : null}
                               <Button
                                 variant="media-close"
                                 size="icon-xs"
@@ -7580,6 +7626,15 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
           </div>
         </ComposerSurface.Main>
       </div>
+      {annotatingImage ? (
+        <ImageAnnotationDialog
+          key={annotatingImage.id}
+          src={annotatingImage.previewUrl}
+          name={annotatingImage.name}
+          onSave={(blob) => saveImageAnnotation(annotatingImage.id, blob)}
+          onClose={closeImageAnnotation}
+        />
+      ) : null}
     </form>
   );
 });
