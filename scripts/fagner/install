@@ -76,6 +76,7 @@ if [ -d "$FAGNER_APP" ]; then
   previous="$(plist_version "$FAGNER_APP")"
   rm -rf "$FAGNER_ROLLBACK_DIR/$FAGNER_APP_NAME previous.app"
   mv "$FAGNER_APP" "$FAGNER_ROLLBACK_DIR/$FAGNER_APP_NAME previous.app"
+  forget_app "$FAGNER_ROLLBACK_DIR/$FAGNER_APP_NAME previous.app"
   log "Moved the previous fork build $previous aside"
 fi
 
@@ -84,6 +85,10 @@ fi
 mv "$FAGNER_APP.partial" "$FAGNER_APP"
 /usr/bin/codesign --verify --deep --strict "$FAGNER_APP" || die "The installed app fails codesign --verify."
 log "Installed $FAGNER_APP ($version)"
+# Every copy shares the bundle id, so macOS must know only this one, or a relaunch can open another
+# copy against the same T3 home ("This T3 home is unavailable").
+forget_app "$app"
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$FAGNER_APP"
 
 write_cli_shim "$FAGNER_APP"
 

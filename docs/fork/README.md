@@ -23,7 +23,7 @@ backup.
 
 | Script            | Does                                                                                                                                                     |
 | ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `build`           | Builds `T3 Code (Fagner).app` with its `t3` CLI into `~/work/t3code-fagner-builds/<version>/`, ad-hoc signs it, points `latest` at it.                   |
+| `build`           | Builds `T3 Code (Fagner).app` with its `t3` CLI into `~/work/t3code-fagner-builds.noindex/<version>/`, ad-hoc signs it, points `latest` at it.           |
 | `install --quit`  | Quits T3 gracefully, keeps the running Nightly for rollback, puts the newest build in `/Applications`, points `~/.t3/bin/t3` at it, relaunches.          |
 | `rollback --quit` | The reverse: puts the kept Nightly back, points `t3` at it, relaunches it.                                                                               |
 | `update`          | Fetches upstream, merges the newest Nightly tag into `fagner/main` (stops if it adds migrations, unless `--accept-migrations`), installs, tests, builds. |
@@ -48,7 +48,7 @@ start it when nothing important is mid-run. Follow it with
 What changes on disk:
 
 - `/Applications/T3 Code (Nightly).app` moves to
-  `~/work/t3code-fagner-builds/rollback/T3 Code (Nightly) 0.1.5-nightly.20261029.3877.app` (an
+  `~/work/t3code-fagner-builds.noindex/rollback/T3 Code (Nightly) 0.1.5-nightly.20261029.3877.app` (an
   APFS clone, no extra space). If Nightly had downloaded an update, it installs on quit; that
   copy never ran and is kept separately as `… (never ran).app`.
 - `/Applications/T3 Code (Fagner).app` is the new app.
@@ -78,7 +78,7 @@ What changes on disk:
 ~/work/t3code-worktrees/fagner-main/scripts/fagner/rollback --quit
 ```
 
-It quits the fork, moves it to `~/work/t3code-fagner-builds/rollback/T3 Code (Fagner)
+It quits the fork, moves it to `~/work/t3code-fagner-builds.noindex/rollback/T3 Code (Fagner)
 uninstalled.app`, puts the kept Nightly 3877 back in `/Applications`, points `t3` at it and
 opens it. The data needs nothing: the fork never changed its schema.
 

@@ -2,7 +2,7 @@
 # shellcheck shell=bash
 
 FAGNER_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-FAGNER_BUILDS_DIR="${T3_FAGNER_BUILDS_DIR:-$HOME/work/t3code-fagner-builds}"
+FAGNER_BUILDS_DIR="${T3_FAGNER_BUILDS_DIR:-$HOME/work/t3code-fagner-builds.noindex}"
 FAGNER_ROLLBACK_DIR="$FAGNER_BUILDS_DIR/rollback"
 FAGNER_APP_NAME="T3 Code (Fagner)"
 # Overrides exist so the scripts can be tested on a scratch folder and a bundle id nothing runs.
@@ -115,4 +115,9 @@ detach_self() {
   /usr/bin/nohup /usr/bin/perl -e 'use POSIX qw(setsid); setsid(); exec @ARGV or die "exec: $!"' \
     "$script" --foreground "$@" >>"$log_file" 2>&1 </dev/null &
   echo "Running detached (pid $!). Log: $log_file"
+}
+
+# macOS forgets this copy of the app, so it never opens it in place of the installed one.
+forget_app() {
+  /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -u "$1" 2>/dev/null || true
 }
