@@ -24,7 +24,11 @@ cd "$FAGNER_REPO_ROOT"
 if [ -z "$version" ]; then
   base_tag="$(git describe --tags --abbrev=0 --match 'v*-nightly.*' HEAD)"
   base="${base_tag#v}"
+  # Past every number already used: a build folder, or the installed app (whose folder may be
+  # gone, as builds from before the .noindex move are).
+  installed="$(plist_version "/Applications/$FAGNER_APP_NAME.app" || true)"
   n=1
+  case "$installed" in "$base-fagner."[0-9]*) n=$((${installed##*-fagner.} + 1)) ;; esac
   while [ -e "$FAGNER_BUILDS_DIR/$base-fagner.$n" ]; do n=$((n + 1)); done
   version="$base-fagner.$n"
 fi
