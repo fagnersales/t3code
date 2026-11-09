@@ -35,6 +35,10 @@ out="$FAGNER_BUILDS_DIR/$version"
 mkdir -p "$out"
 log "Building $FAGNER_APP_NAME $version ($arch) from $(git rev-parse --short HEAD) into $out"
 
+# T3 Connect works only in builds that carry its public settings.
+set -a
+source "$FAGNER_REPO_ROOT/scripts/fagner/public-config.env"
+set +a
 # A repository variable here would make the build embed an update feed.
 env -u GITHUB_REPOSITORY -u T3CODE_DESKTOP_UPDATE_REPOSITORY PATH="$FAGNER_REPO_ROOT/node_modules/.bin:$PATH" \
   node scripts/build-desktop-artifact.ts --platform mac --target zip --arch "$arch" \
