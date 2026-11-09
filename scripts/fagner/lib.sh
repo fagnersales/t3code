@@ -82,6 +82,27 @@ quit_t3_gracefully() {
   fi
 }
 
+# Open the app and make sure it stays open: right after the old copy quits, a new one can quit
+# again within seconds, so try again a few times.
+LAUNCH_SETTLE_SECONDS=10
+LAUNCH_ATTEMPTS=5
+launch_app() {
+  local app="$1" name attempt
+  name="$(basename "$app" .app)"
+  for attempt in $(seq 1 "$LAUNCH_ATTEMPTS"); do
+    /usr/bin/open "$app"
+    sleep "$LAUNCH_SETTLE_SECONDS"
+    if [ -n "$(running_app_pids)" ]; then
+      log "Launched $name"
+      return 0
+    fi
+    log "$name quit right after launch (attempt $attempt of $LAUNCH_ATTEMPTS). Its processes still running:"
+    /bin/ps -axo pid,etime,command | grep -F "/$name.app/" | grep -v -e grep -e ' follow ' | cut -c1-200 || true
+    sleep $((attempt * 3))
+  done
+  die "$name did not stay open after $LAUNCH_ATTEMPTS launches. Open it yourself."
+}
+
 # The launcher T3 writes for itself (DesktopCliShim.ts), pointed at an app bundle.
 write_cli_shim() {
   local app="$1" exe

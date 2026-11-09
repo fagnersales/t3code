@@ -56,7 +56,6 @@ log "Restored $NIGHTLY_APP"
 write_cli_shim "$NIGHTLY_APP"
 
 if [ "$relaunch" = 1 ]; then
-  /usr/bin/open "$NIGHTLY_APP"
-  log "Launched $NIGHTLY_APP_NAME"
+  launch_app "$NIGHTLY_APP"
 fi
 log "rollback finished"

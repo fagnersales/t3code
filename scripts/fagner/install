@@ -93,7 +93,6 @@ forget_app "$app"
 write_cli_shim "$FAGNER_APP"
 
 if [ "$relaunch" = 1 ]; then
-  /usr/bin/open "$FAGNER_APP"
-  log "Launched $FAGNER_APP_NAME"
+  launch_app "$FAGNER_APP"
 fi
 log "install finished. Rollback: scripts/fagner/rollback --quit"
