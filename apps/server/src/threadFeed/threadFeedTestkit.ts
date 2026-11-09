@@ -7,6 +7,7 @@ import {
   type OrchestrationV2Run,
   type OrchestrationV2RuntimeRequest,
   type OrchestrationV2TurnItem,
+  type ProjectId,
   ProviderInstanceId,
   RunId,
   RuntimeRequestId,
@@ -78,12 +79,21 @@ export const writeEvents = Effect.fn("threadFeedTestkit.writeEvents")(function* 
   return stored.at(-1)?.sequence ?? 0;
 });
 
-export const seedThread = Effect.fn("threadFeedTestkit.seedThread")(function* (title: string) {
+export const seedThread = (title: string) =>
+  seedThreadRecord(title).pipe(Effect.map((thread) => thread.id));
+
+/** A new thread in its own project, or in `projectId`; a subagent of `parentThreadId`. */
+export const seedThreadRecord = Effect.fn("threadFeedTestkit.seedThreadRecord")(function* (
+  title: string,
+  options?: { readonly projectId?: ProjectId; readonly parentThreadId?: ThreadId },
+) {
   const idAllocator = yield* IdAllocator.IdAllocatorV2;
   const eventSink = yield* EventSink.EventSinkV2;
   const now = yield* DateTime.now;
-  const projectId = yield* idAllocator.allocate.project({ fixtureName: "thread-feed" });
+  const projectId =
+    options?.projectId ?? (yield* idAllocator.allocate.project({ fixtureName: "thread-feed" }));
   const threadId = yield* idAllocator.allocate.thread({ fixtureName: "thread-feed", projectId });
+  const parent = options?.parentThreadId;
   const thread: OrchestrationV2AppThread = {
     createdBy: "user",
     creationSource: "web",
@@ -99,7 +109,10 @@ export const seedThread = Effect.fn("threadFeedTestkit.seedThread")(function* (t
     branchPullRequest: null,
     activeOrderKey: null,
     activeProviderThreadId: null,
-    lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+    lineage:
+      parent === undefined
+        ? { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId }
+        : { parentThreadId: parent, relationshipToParent: "subagent", rootThreadId: parent },
     forkedFrom: null,
     createdAt: now,
     updatedAt: now,
@@ -120,7 +133,32 @@ export const seedThread = Effect.fn("threadFeedTestkit.seedThread")(function* (t
       },
     ],
   });
-  return threadId;
+  return thread;
+});
+
+/** Writes a thread lifecycle event (rename, settle, archive, delete…) with the changed thread. */
+export const writeThreadEvent = Effect.fn("threadFeedTestkit.writeThreadEvent")(function* (
+  type: Exclude<
+    Extract<OrchestrationV2DomainEvent, { payload: OrchestrationV2AppThread }>["type"],
+    "thread.created"
+  >,
+  thread: OrchestrationV2AppThread,
+) {
+  const idAllocator = yield* IdAllocator.IdAllocatorV2;
+  const eventSink = yield* EventSink.EventSinkV2;
+  const now = yield* DateTime.now;
+  const stored = yield* eventSink.write({
+    events: [
+      {
+        id: yield* idAllocator.allocate.event({ threadId: thread.id }),
+        type,
+        threadId: thread.id,
+        occurredAt: now,
+        payload: { ...thread, updatedAt: now },
+      } as OrchestrationV2DomainEvent,
+    ],
+  });
+  return stored.at(-1)?.sequence ?? 0;
 });
 
 const baseItem = (threadId: ThreadId, ordinal: number, now: DateTime.Utc) => ({

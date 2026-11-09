@@ -42,6 +42,7 @@ import {
 } from "../serverRuntimeState.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
 import { type CliAuthLocationFlags, projectLocationFlags, resolveCliAuthConfig } from "./config.ts";
+import { projectFollowCommand } from "./projectFollow.ts";
 
 type ProjectMutationTarget = {
   readonly id: ProjectId;
@@ -583,5 +584,10 @@ const projectRenameCommand = Command.make("rename", {
 
 export const projectCommand = Command.make("project").pipe(
   Command.withDescription("Manage projects."),
-  Command.withSubcommands([projectAddCommand, projectRemoveCommand, projectRenameCommand]),
+  Command.withSubcommands([
+    projectAddCommand,
+    projectRemoveCommand,
+    projectRenameCommand,
+    projectFollowCommand,
+  ]),
 );

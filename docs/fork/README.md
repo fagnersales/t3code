@@ -1,6 +1,6 @@
 # fagnersales/t3code
 
-Fagner's T3 Code: the Nightly he ran, plus a live thread feed for Headquarters. Branch
+Fagner's T3 Code: the Nightly he ran, plus live thread and project feeds for Headquarters. Branch
 `fagner/main`.
 
 ## What it is
@@ -12,6 +12,8 @@ Fagner's T3 Code: the Nightly he ran, plus a live thread feed for Headquarters. 
   through it (backport of upstream PR #33079, branch `perf/thread-read-tail`).
 - **Live feed:** `t3 thread follow` and `GET /api/thread-feed/v1`, see
   [thread-feed.md](thread-feed.md).
+- **Project feed:** `t3 project follow` and `GET /api/project-feed/v1`, a project's threads live
+  (created, running, waiting, settled, archived, deleted), see [project-feed.md](project-feed.md).
 - **Build identity:** versions `<nightly>-fagner.N`, app name `T3 Code (Fagner)`, no update feed
   (the updater reports updates as unavailable, so nothing can replace it with upstream).
 
