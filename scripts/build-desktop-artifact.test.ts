@@ -516,6 +516,16 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
         undefined,
       );
 
+      const fork = yield* createBuildConfig(
+        "mac",
+        "dmg",
+        "0.1.5-nightly.20261029.3877-fagner.1",
+        false,
+        false,
+        undefined,
+        undefined,
+      );
+
       const previewChannel = yield* createBuildConfig(
         "mac",
         "dmg",
@@ -528,6 +538,8 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
 
       assert.isNull(preview.publish);
       assert.isNull(previewChannel.publish);
+      assert.isNull(fork.publish);
+      assert.equal(fork.productName, "T3 Code (Fagner)");
       assert.deepStrictEqual(release.publish, [
         {
           provider: "github",

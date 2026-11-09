@@ -1,0 +1,94 @@
+#!/bin/bash
+# Replace T3 Code (Nightly) with the newest fork build (or --app PATH), then relaunch.
+#
+#   scripts/fagner/install --quit            quit the running T3, swap, relaunch (detaches itself)
+#   scripts/fagner/install                   only if T3 is not running
+#   options: --app PATH  --no-relaunch  --foreground (stay attached; used by the detached copy)
+#
+# It never copies or touches the database: the fork adds no migrations, so the Nightly kept in
+# $FAGNER_ROLLBACK_DIR opens the same data (scripts/fagner/rollback).
+set -euo pipefail
+source "$(dirname "$0")/lib.sh"
+
+quit=0 relaunch=1 foreground=0 app=""
+args=("$@")
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --quit) quit=1 ;;
+    --no-relaunch) relaunch=0 ;;
+    --foreground) foreground=1 ;;
+    --app) app="$2"; shift ;;
+    -h | --help) sed -n '2,10p' "$0"; exit 0 ;;
+    *) die "Unknown option $1" ;;
+  esac
+  shift
+done
+
+if [ "$foreground" = 0 ]; then
+  log_file="$HOME/Library/Logs/t3code-fagner/install-$(date '+%Y%m%d-%H%M%S').log"
+  detach_self "$(cd "$(dirname "$0")" && pwd)/$(basename "$0")" "$log_file" "${args[@]+"${args[@]}"}"
+  exit 0
+fi
+
+log "install started (pid $$)"
+[ -n "$app" ] || app="$FAGNER_BUILDS_DIR/latest/$FAGNER_APP_NAME.app"
+app="$(cd "$(dirname "$app")" && pwd -P)/$(basename "$app")"
+[ -d "$app" ] || die "No build at $app. Run scripts/fagner/build first."
+version="$(plist_version "$app")"
+case "$version" in *-fagner.*) ;; *) die "$app is version '$version', not a fork build." ;; esac
+[ ! -e "$app/Contents/Resources/app-update.yml" ] || die "$app has an update feed; refusing to install it."
+/usr/bin/codesign --verify --deep --strict "$app" || die "$app fails codesign --verify."
+log "Installing $FAGNER_APP_NAME $version from $app"
+
+if [ -n "$(running_app_pids)" ] && [ "$quit" = 0 ]; then
+  die "T3 Code is running. Run again with --quit to quit it first."
+fi
+
+mkdir -p "$FAGNER_ROLLBACK_DIR"
+# Keep the exact Nightly that wrote the database, before a pending update can replace it on quit.
+# An APFS clone (cp -c) costs no disk space.
+nightly_before=""
+if [ -d "$NIGHTLY_APP" ]; then
+  nightly_before="$(plist_version "$NIGHTLY_APP")"
+  keep="$FAGNER_ROLLBACK_DIR/$NIGHTLY_APP_NAME $nightly_before.app"
+  if [ ! -d "$keep" ]; then
+    /bin/cp -cR "$NIGHTLY_APP" "$keep.partial"
+    mv "$keep.partial" "$keep"
+    log "Kept Nightly $nightly_before at $keep"
+  fi
+fi
+
+quit_t3_gracefully
+
+if [ -d "$NIGHTLY_APP" ]; then
+  nightly_after="$(plist_version "$NIGHTLY_APP")"
+  if [ "$nightly_after" = "$nightly_before" ]; then
+    rm -rf "$NIGHTLY_APP"
+    log "Removed $NIGHTLY_APP (its copy stays in $FAGNER_ROLLBACK_DIR)"
+  else
+    # A staged update replaced it while quitting; it never ran on this data. Keep both.
+    mv "$NIGHTLY_APP" "$FAGNER_ROLLBACK_DIR/$NIGHTLY_APP_NAME $nightly_after (never ran).app"
+    log "Nightly updated itself to $nightly_after on quit; moved it aside. Roll back to $nightly_before."
+  fi
+fi
+
+if [ -d "$FAGNER_APP" ]; then
+  previous="$(plist_version "$FAGNER_APP")"
+  rm -rf "$FAGNER_ROLLBACK_DIR/$FAGNER_APP_NAME previous.app"
+  mv "$FAGNER_APP" "$FAGNER_ROLLBACK_DIR/$FAGNER_APP_NAME previous.app"
+  log "Moved the previous fork build $previous aside"
+fi
+
+/bin/cp -cR "$app" "$FAGNER_APP.partial"
+/usr/bin/xattr -dr com.apple.quarantine "$FAGNER_APP.partial" 2>/dev/null || true
+mv "$FAGNER_APP.partial" "$FAGNER_APP"
+/usr/bin/codesign --verify --deep --strict "$FAGNER_APP" || die "The installed app fails codesign --verify."
+log "Installed $FAGNER_APP ($version)"
+
+write_cli_shim "$FAGNER_APP"
+
+if [ "$relaunch" = 1 ]; then
+  /usr/bin/open "$FAGNER_APP"
+  log "Launched $FAGNER_APP_NAME"
+fi
+log "install finished. Rollback: scripts/fagner/rollback --quit"

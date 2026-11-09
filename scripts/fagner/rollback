@@ -1,0 +1,62 @@
+#!/bin/bash
+# Go back to the Nightly that ran before the fork: quit, swap the apps back, relaunch Nightly.
+#
+#   scripts/fagner/rollback --quit           (detaches itself, logs to ~/Library/Logs/t3code-fagner)
+#   options: --nightly PATH  --no-relaunch  --foreground
+#
+# Safe on the same data only because the fork adds no database migrations. Nightly's updater
+# comes back with it and will update it later; a newer Nightly migrates the data forward, after
+# which only a fork rebuilt on that Nightly (scripts/fagner/update) can open it again.
+set -euo pipefail
+source "$(dirname "$0")/lib.sh"
+
+quit=0 relaunch=1 foreground=0 nightly=""
+args=("$@")
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --quit) quit=1 ;;
+    --no-relaunch) relaunch=0 ;;
+    --foreground) foreground=1 ;;
+    --nightly) nightly="$2"; shift ;;
+    -h | --help) sed -n '2,10p' "$0"; exit 0 ;;
+    *) die "Unknown option $1" ;;
+  esac
+  shift
+done
+
+if [ "$foreground" = 0 ]; then
+  log_file="$HOME/Library/Logs/t3code-fagner/rollback-$(date '+%Y%m%d-%H%M%S').log"
+  detach_self "$(cd "$(dirname "$0")" && pwd)/$(basename "$0")" "$log_file" "${args[@]+"${args[@]}"}"
+  exit 0
+fi
+
+log "rollback started (pid $$)"
+if [ -z "$nightly" ]; then
+  # The kept Nightly that ran on this data, never one that updated itself while quitting.
+  nightly="$(ls -d "$FAGNER_ROLLBACK_DIR/$NIGHTLY_APP_NAME "*.app 2>/dev/null | grep -v '(never ran)' | sort -V | tail -1 || true)"
+fi
+[ -n "$nightly" ] && [ -d "$nightly" ] || die "No kept Nightly in $FAGNER_ROLLBACK_DIR. Pass --nightly PATH."
+log "Restoring $(plist_version "$nightly") from $nightly"
+
+if [ -n "$(running_app_pids)" ] && [ "$quit" = 0 ]; then
+  die "T3 Code is running. Run again with --quit to quit it first."
+fi
+quit_t3_gracefully
+
+if [ -d "$FAGNER_APP" ]; then
+  rm -rf "$FAGNER_ROLLBACK_DIR/$FAGNER_APP_NAME uninstalled.app"
+  mv "$FAGNER_APP" "$FAGNER_ROLLBACK_DIR/$FAGNER_APP_NAME uninstalled.app"
+  log "Moved $FAGNER_APP aside"
+fi
+[ ! -e "$NIGHTLY_APP" ] || die "$NIGHTLY_APP already exists; move it away first."
+/bin/cp -cR "$nightly" "$NIGHTLY_APP"
+/usr/bin/codesign --verify --deep --strict "$NIGHTLY_APP" || log "warning: $NIGHTLY_APP fails codesign --verify"
+log "Restored $NIGHTLY_APP"
+
+write_cli_shim "$NIGHTLY_APP"
+
+if [ "$relaunch" = 1 ]; then
+  /usr/bin/open "$NIGHTLY_APP"
+  log "Launched $NIGHTLY_APP_NAME"
+fi
+log "rollback finished"

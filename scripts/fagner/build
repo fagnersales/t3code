@@ -1,0 +1,67 @@
+#!/bin/bash
+# Build the macOS app and its t3 CLI from this checkout, ready for scripts/fagner/install.
+#
+#   scripts/fagner/build [--version 0.1.5-nightly.20261029.3877-fagner.2] [--arch arm64]
+#
+# The version defaults to the Nightly tag this checkout is based on plus the next free
+# -fagner.N. Output: $FAGNER_BUILDS_DIR/<version>/T3 Code (Fagner).app, ad-hoc signed, and the
+# `latest` link pointing at it. Builds without an update feed, so the app never updates itself.
+set -euo pipefail
+source "$(dirname "$0")/lib.sh"
+
+version="" arch="arm64"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --version) version="$2"; shift ;;
+    --arch) arch="$2"; shift ;;
+    -h | --help) sed -n '2,9p' "$0"; exit 0 ;;
+    *) die "Unknown option $1" ;;
+  esac
+  shift
+done
+
+cd "$FAGNER_REPO_ROOT"
+if [ -z "$version" ]; then
+  base_tag="$(git describe --tags --abbrev=0 --match 'v*-nightly.*' HEAD)"
+  base="${base_tag#v}"
+  n=1
+  while [ -e "$FAGNER_BUILDS_DIR/$base-fagner.$n" ]; do n=$((n + 1)); done
+  version="$base-fagner.$n"
+fi
+case "$version" in *-nightly.*-fagner.[0-9]*) ;; *) die "Version '$version' must look like X-nightly.YYYYMMDD.N-fagner.N" ;; esac
+
+out="$FAGNER_BUILDS_DIR/$version"
+[ ! -e "$out/$FAGNER_APP_NAME.app" ] || die "$out already has a build."
+mkdir -p "$out"
+log "Building $FAGNER_APP_NAME $version ($arch) from $(git rev-parse --short HEAD) into $out"
+
+# A repository variable here would make the build embed an update feed.
+env -u GITHUB_REPOSITORY -u T3CODE_DESKTOP_UPDATE_REPOSITORY PATH="$FAGNER_REPO_ROOT/node_modules/.bin:$PATH" \
+  node scripts/build-desktop-artifact.ts --platform mac --target zip --arch "$arch" \
+  --build-version "$version" --output-dir "$out"
+
+zip="$(ls "$out"/*.zip | head -1)"
+[ -f "$zip" ] || die "The build produced no zip in $out"
+/usr/bin/ditto -x -k "$zip" "$out/unpacked"
+built="$(ls -d "$out/unpacked/"*.app | head -1)"
+[ "$(basename "$built")" = "$FAGNER_APP_NAME.app" ] || die "Unexpected app name: $built"
+mv "$built" "$out/$FAGNER_APP_NAME.app"
+rm -rf "$out/unpacked"
+app="$out/$FAGNER_APP_NAME.app"
+
+[ "$(plist_version "$app")" = "$version" ] || die "The app reports $(plist_version "$app"), not $version"
+[ ! -e "$app/Contents/Resources/app-update.yml" ] || die "The build has an update feed (app-update.yml)"
+[ -f "$app/Contents/Resources/app.asar" ] || die "No app.asar in the build"
+
+identity="${T3_FAGNER_SIGN_IDENTITY:--}"
+/usr/bin/codesign --force --deep --sign "$identity" "$app"
+/usr/bin/codesign --verify --deep --strict "$app"
+log "Signed with identity '$identity' (- is ad-hoc)"
+
+ELECTRON_RUN_AS_NODE=1 "$app/Contents/MacOS/$FAGNER_APP_NAME" \
+  "$app/Contents/Resources/app.asar/apps/server/dist/bin.mjs" --version
+ELECTRON_RUN_AS_NODE=1 "$app/Contents/MacOS/$FAGNER_APP_NAME" \
+  "$app/Contents/Resources/app.asar/apps/server/dist/bin.mjs" thread follow --help >/dev/null
+
+ln -sfn "$version" "$FAGNER_BUILDS_DIR/latest"
+log "Ready: $app (latest -> $version)"

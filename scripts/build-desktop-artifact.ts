@@ -2706,7 +2706,7 @@ export const resolveGitHubPublishConfig = Effect.fn("resolveGitHubPublishConfig"
 });
 
 export function resolveDesktopUpdateChannel(version: string): "latest" | "nightly" {
-  return /-nightly\.\d{8}\.\d+$/.test(version) ? "nightly" : "latest";
+  return /-nightly\.\d{8}\.\d+(?:-fagner\.\d+)?$/.test(version) ? "nightly" : "latest";
 }
 
 export function isDesktopPreviewVersion(version: string): boolean {
@@ -2748,7 +2748,13 @@ export function resolvePackageManagerUserAgent(packageManager: string): string {
   return `${trimmed.slice(0, versionSeparator)}/${trimmed.slice(versionSeparator + 1)}`;
 }
 
+/** fagnersales/t3code builds: Nightly identity, own name, and never an update feed. */
+export function isFagnerForkVersion(version: string): boolean {
+  return /-fagner\.\d+$/.test(version);
+}
+
 export function resolveDesktopProductName(version: string): string {
+  if (isFagnerForkVersion(version)) return "T3 Code (Fagner)";
   return resolveDesktopUpdateChannel(version) === "nightly"
     ? "T3 Code (Nightly)"
     : (desktopPackageJson.productName ?? "T3 Code");
@@ -2801,7 +2807,7 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
   const updateChannel = resolveDesktopUpdateChannel(version);
   // Missing publish config infers a GitHub feed from tokens; staging has no repository, so manifest generation would crash.
   buildConfig.publish = null;
-  if (!isDesktopPreviewVersion(version)) {
+  if (!isDesktopPreviewVersion(version) && !isFagnerForkVersion(version)) {
     const publishConfig = yield* resolveGitHubPublishConfig(updateChannel);
     if (publishConfig) {
       buildConfig.publish = [publishConfig];

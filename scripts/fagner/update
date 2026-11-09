@@ -1,0 +1,79 @@
+#!/bin/bash
+# Move fagner/main to a newer upstream Nightly, test it, and build it.
+#
+#   scripts/fagner/update [--to v0.1.8-nightly.20261109.4399] [--accept-migrations]
+#                         [--skip-tests] [--skip-build] [--push]
+#
+# Defaults to the newest upstream Nightly tag. Merges (fagner/main is pushed, so no rebase).
+# A Nightly tag that adds database migrations stops unless --accept-migrations: once a build
+# with them runs, older Nightlies, including the one kept for rollback, cannot open the data.
+set -euo pipefail
+source "$(dirname "$0")/lib.sh"
+
+to="" accept=0 tests=1 build=1 push=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --to) to="$2"; shift ;;
+    --accept-migrations) accept=1 ;;
+    --skip-tests) tests=0 ;;
+    --skip-build) build=0 ;;
+    --push) push=1 ;;
+    -h | --help) sed -n '2,10p' "$0"; exit 0 ;;
+    *) die "Unknown option $1" ;;
+  esac
+  shift
+done
+
+cd "$FAGNER_REPO_ROOT"
+[ "$(git branch --show-current)" = "fagner/main" ] || die "Check out fagner/main first."
+[ -z "$(git status --porcelain)" ] || die "The working tree has changes; commit or stash them."
+upstream="$(upstream_remote)"
+fork="$(fork_remote)"
+[ -n "$upstream" ] || die "No remote for pingdotgg/t3code."
+[ -n "$fork" ] || die "No remote for fagnersales/t3code."
+log "Fetching $upstream and $fork..."
+git fetch --tags --prune "$upstream"
+git fetch --prune "$fork"
+
+if [ -z "$to" ]; then
+  to="$(git tag -l 'v*-nightly.*' --sort=-creatordate | head -1)"
+fi
+git rev-parse --verify --quiet "$to^{commit}" >/dev/null || die "Unknown ref $to"
+
+if git merge-base --is-ancestor "$to" HEAD; then
+  log "fagner/main already contains $to."
+else
+  added="$(git diff --name-only --diff-filter=A HEAD..."$to" -- apps/server/src/persistence/Migrations ':!*.test.ts' || true)"
+  if [ -n "$added" ] && [ "$accept" = 0 ]; then
+    log "$to adds database migrations:"
+    echo "$added" | sed 's/^/    /'
+    die "Rerun with --accept-migrations to take them (the kept Nightly then can no longer open the data)."
+  fi
+  log "Merging $to into fagner/main..."
+  if ! git merge --no-edit "$to"; then
+    die "The merge has conflicts. Resolve them, commit, then run: scripts/fagner/update --to $to"
+  fi
+fi
+
+log "Installing dependencies..."
+pnpm install --frozen-lockfile
+
+if [ "$tests" = 1 ]; then
+  export PATH="$FAGNER_REPO_ROOT/node_modules/.bin:$PATH"
+  log "Typecheck (server) and the fork's tests..."
+  (cd apps/server && vp run typecheck)
+  (cd apps/server && vp test run src/threadFeed src/cli/threadFollow.test.ts src/cli/thread.test.ts \
+    src/orchestration-v2/ProjectionStore.test.ts src/mcp/OrchestratorMcpService.activity.test.ts \
+    src/provider/AgentContextBudget.test.ts)
+  (cd packages/shared && vp test run src/cliRelease.test.ts)
+  vp test run scripts/build-desktop-artifact.test.ts
+fi
+
+if [ "$push" = 1 ]; then
+  git push "$fork" fagner/main
+fi
+
+if [ "$build" = 1 ]; then
+  "$FAGNER_REPO_ROOT/scripts/fagner/build"
+fi
+log "update finished. Install with: scripts/fagner/install --quit"

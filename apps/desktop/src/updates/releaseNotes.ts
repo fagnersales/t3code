@@ -153,7 +153,7 @@ function extractReleaseNoteItems(note: string | null | undefined): ExtractedRele
 }
 
 // The update feed dates only the offered version; prerelease versions carry their UTC build day.
-const PRERELEASE_BUILD_DAY = /-(?:nightly|preview)\.(\d{4})(\d{2})(\d{2})\.\d+$/;
+const PRERELEASE_BUILD_DAY = /-(?:nightly|preview)\.(\d{4})(\d{2})(\d{2})\.\d+(?:-fagner\.\d+)?$/;
 
 function resolveReleasedAt(version: string, offeredVersion: string, releaseDate?: string) {
   if (version === offeredVersion && releaseDate) return releaseDate;
