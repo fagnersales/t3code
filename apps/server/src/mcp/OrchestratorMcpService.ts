@@ -2940,6 +2940,7 @@ const make = Effect.gen(function* () {
           mode,
           createdBy: "agent",
           creationSource: "mcp",
+          compactIfCold: true,
         })
         .pipe(
           Effect.mapError((error) =>
@@ -2959,6 +2960,7 @@ const make = Effect.gen(function* () {
         ...(result.run.delegatedTaskId === undefined ? {} : { taskId: result.run.delegatedTaskId }),
         status: result.run.status,
         delivery: result.delivery,
+        ...(result.compactedFirst ? { compactedFirst: true } : {}),
       } satisfies OrchestratorMcpThreadSendResult;
     }),
     waitForThread: Effect.fn("OrchestratorMcpService.waitForThread")(function* (scope, input) {

@@ -3,7 +3,6 @@ import { describe, expect, it } from "vite-plus/test";
 import { deriveProviderInstanceEntries } from "../../providerInstances";
 import {
   hasAvailableCompactionProvider,
-  hasDismissedResumeCompaction,
   resolveContextWindowModelDisplayName,
   shouldReserveContextWindowMeter,
 } from "./ContextWindowMeter.logic";
@@ -100,39 +99,6 @@ describe("resolveContextWindowModelDisplayName", () => {
         modelOptionsByInstance,
       ),
     ).toBe("GPT-5.6 Sol");
-  });
-});
-
-describe("hasDismissedResumeCompaction", () => {
-  it("recognizes the native resume dialog's permanent dismissal", () => {
-    expect(
-      hasDismissedResumeCompaction([
-        {
-          kind: "user-input.resolved",
-          payload: {
-            answers: {
-              "This session is 2h 0m old and uses 250,000 tokens. Compact it before continuing?":
-                "Don't ask again",
-            },
-          },
-        },
-      ]),
-    ).toBe(true);
-  });
-
-  it("ignores unrelated questions that end with Claude's compaction prompt", () => {
-    expect(
-      hasDismissedResumeCompaction([
-        {
-          kind: "user-input.resolved",
-          payload: {
-            answers: {
-              "The build cache is large. Compact it before continuing?": "Don't ask again",
-            },
-          },
-        },
-      ]),
-    ).toBe(false);
   });
 });
 

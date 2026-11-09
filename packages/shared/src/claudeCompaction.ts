@@ -16,7 +16,7 @@ export function formatClaudeResumeCompactionQuestion(input: {
 const CLAUDE_RESUME_COMPACTION_QUESTION_PATTERN =
   /^This session is (\d+h \d+m|\d+m) old and uses \d{1,3}(?:,\d{3})* tokens\. Compact it before continuing\?$/u;
 
-export function isClaudeResumeCompactionQuestion(question: string): boolean {
+function isClaudeResumeCompactionQuestion(question: string): boolean {
   return CLAUDE_RESUME_COMPACTION_QUESTION_PATTERN.test(question);
 }
 
@@ -44,3 +44,60 @@ export function claudeResumeCompactionAge(questionAnswer: {
  * idleCompaction default of 200K.
  */
 export const COMPACTION_SUGGESTION_MIN_TOKENS = 200_000;
+
+/** Prompt cache lifetime assumed when Claude reports none: its 1h cache plus slack. */
+const CLAUDE_RESUME_COMPACTION_FALLBACK_MS = 70 * 60_000;
+
+const COMPACT_COMMAND_PATTERN = /^\/compact(?:\s|$)/i;
+
+/** A message that is itself a compaction, so nothing should compact before it. */
+export function isCompactCommand(text: string): boolean {
+  return COMPACT_COMMAND_PATTERN.test(text);
+}
+
+/** Whether the user answered "never" to Claude's native resume-compaction question. */
+export function hasDismissedResumeCompaction(
+  requests: ReadonlyArray<{
+    readonly kind: string;
+    readonly status: string;
+    readonly answers?: unknown;
+  }>,
+): boolean {
+  return requests.some(({ kind, status, answers }) => {
+    if (kind !== "user_input" || status !== "resolved") return false;
+    if (!answers || typeof answers !== "object" || Array.isArray(answers)) return false;
+    return Object.entries(answers).some(
+      ([question, answer]) =>
+        isClaudeResumeCompactionQuestion(question) &&
+        answer === CLAUDE_RESUME_COMPACTION_NEVER_ANSWER,
+    );
+  });
+}
+
+/**
+ * Whether a Claude thread is big and cold enough that its next message should compact first:
+ * at least {@link COMPACTION_SUGGESTION_MIN_TOKENS} in context, and its last usage report older
+ * than the prompt cache, so the next turn would re-read the whole history uncached.
+ */
+export function shouldOfferResumeCompaction(input: {
+  readonly provider: string | null | undefined;
+  readonly usedTokens: number | null | undefined;
+  readonly updatedAt: string | null | undefined;
+  readonly promptCacheTtlMs?: number | undefined;
+  readonly now: string;
+}): boolean {
+  if (
+    input.provider !== "claudeAgent" ||
+    (input.usedTokens ?? 0) < COMPACTION_SUGGESTION_MIN_TOKENS
+  ) {
+    return false;
+  }
+
+  const updatedAt = Date.parse(input.updatedAt ?? "");
+  const now = Date.parse(input.now);
+  return (
+    Number.isFinite(updatedAt) &&
+    Number.isFinite(now) &&
+    now - updatedAt >= (input.promptCacheTtlMs ?? CLAUDE_RESUME_COMPACTION_FALLBACK_MS)
+  );
+}

@@ -11,7 +11,7 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import { makeThreadProjectionFixture } from "../test-fixtures";
-import { shouldOfferResumeCompaction } from "../components/chat/ContextWindowMeter.logic";
+import { shouldOfferResumeCompaction } from "@t3tools/shared/claudeCompaction";
 import { deriveLatestContextWindowSnapshot, latestProviderTurnTokenUsage } from "./contextWindow";
 
 const decodeTokenUsage = Schema.decodeSync(OrchestrationV2ProviderTurnTokenUsage);

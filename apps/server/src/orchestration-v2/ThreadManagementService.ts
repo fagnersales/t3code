@@ -11,6 +11,7 @@ import type {
 import {
   type ChatAttachment,
   CommandId,
+  IDLE_COMPACTION_TEXT,
   MessageId,
   OrchestrationV2StopWorkflowError,
   type OrchestrationV2StopWorkflowInput,
@@ -30,6 +31,7 @@ import {
   ProjectId,
   PROVIDER_SEND_TURN_MAX_FILE_BYTES,
   ProviderInstanceId,
+  resolveIdleCompaction,
   resolveProjectProviderInstanceEnabled,
   RunId,
   type ScheduledTaskId,
@@ -49,6 +51,7 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
 import * as CommandReceiptStore from "./CommandReceiptStore.ts";
+import { shouldCompactBeforeSend } from "./IdleCompaction.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import { projectedRowEncodedBytes } from "./threadHistoryPaging.ts";
@@ -140,6 +143,8 @@ export interface ThreadManagementSendInput {
   readonly mode: ThreadManagementSendMode;
   readonly createdBy: OrchestrationV2Actor;
   readonly creationSource: OrchestrationV2CreationSource;
+  /** Compact a big Claude session whose prompt cache expired before an idle thread takes this message. */
+  readonly compactIfCold?: boolean;
 }
 
 export interface ThreadManagementSendResult {
@@ -152,6 +157,8 @@ export interface ThreadManagementSendResult {
   readonly run: OrchestrationV2Run;
   readonly turnItem: Extract<OrchestrationV2TurnItem, { readonly type: "user_message" }> | null;
   readonly delivery: "started" | "queued" | "steered" | "restarted";
+  /** A `/compact` run went ahead of the message, which queued behind it. */
+  readonly compactedFirst: boolean;
 }
 
 export interface ThreadManagementWaitInput {
@@ -769,18 +776,64 @@ const make = Effect.gen(function* () {
   const sendToThread: ThreadManagementServiceShape["sendToThread"] = Effect.fn(
     "ThreadManagementService.sendToThread",
   )(function* (input) {
-    const target = yield* getProjectThreadRecords(input, ["runs", "providerTurns"]);
+    const target = yield* getProjectThreadRecords(
+      input,
+      input.compactIfCold === true
+        ? [
+            "runs",
+            "providerTurns",
+            "providerThreads",
+            "runtimeRequests",
+            "turnItems",
+            "contextTransfers",
+          ]
+        : ["runs", "providerTurns"],
+      input.compactIfCold === true
+        ? { turnItemStatuses: ["pending", "running", "waiting"] }
+        : undefined,
+    );
     if (target.thread.archivedAt !== null) {
       return yield* new ThreadManagementThreadArchivedError({
         threadId: input.threadId,
       });
     }
     const steerableRun = latestSteerableRun(target);
+    const compactFirst =
+      input.compactIfCold === true &&
+      input.mode !== "steer" &&
+      input.mode !== "restart" &&
+      // A retried send replays its receipt and starts nothing new.
+      !(yield* hasReceipt(input.commandId)) &&
+      shouldCompactBeforeSend(target, {
+        text: input.text,
+        mode: resolveIdleCompaction(
+          yield* serverSettings.getSettings.pipe(Effect.orDie),
+          target.thread.providerInstanceId,
+        ),
+        instanceId: input.modelSelection?.instanceId,
+        now: DateTime.formatIso(yield* DateTime.now),
+      });
+    if (compactFirst) {
+      yield* dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make(`${input.commandId}:compact-first`),
+        messageId: MessageId.make(`${input.messageId}:compact-first`),
+        threadId: input.threadId,
+        text: IDLE_COMPACTION_TEXT,
+        attachments: [],
+        createdBy: input.createdBy,
+        creationSource: input.creationSource,
+        idleCompaction: "onReturn",
+        dispatchMode: { type: "start_immediately" },
+      });
+    }
     let dispatchMode: Extract<
       OrchestrationV2Command,
       { readonly type: "message.dispatch" }
     >["dispatchMode"];
-    if (input.mode === "steer" || input.mode === "restart") {
+    if (compactFirst) {
+      dispatchMode = { type: "queue_after_active" };
+    } else if (input.mode === "steer" || input.mode === "restart") {
       if (steerableRun === undefined) {
         return yield* new ThreadManagementNoSteerableRunError({
           threadId: input.threadId,
@@ -847,7 +900,15 @@ const make = Effect.gen(function* () {
           : input.mode === "restart"
             ? "restarted"
             : "steered";
-    return { dispatch: dispatched, projection, message, run, turnItem, delivery };
+    return {
+      dispatch: dispatched,
+      projection,
+      message,
+      run,
+      turnItem,
+      delivery,
+      compactedFirst: compactFirst,
+    };
   });
 
   const waitForThread: ThreadManagementServiceShape["waitForThread"] = Effect.fn(

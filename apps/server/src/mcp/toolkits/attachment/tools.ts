@@ -62,6 +62,7 @@ const AttachmentSendTool = Tool.make("t3_thread_send_attachments", {
     messageId: MessageId,
     runId: RunId,
     status: OrchestrationV2RunStatus,
+    compactedFirst: Schema.optional(Schema.Boolean),
   }),
 })
   .annotate(Tool.Destructive, true)

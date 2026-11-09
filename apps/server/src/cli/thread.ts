@@ -761,7 +761,7 @@ const threadSendCommand = Command.make("send", {
   json: jsonFlag,
 }).pipe(
   Command.withDescription(
-    "Send a message to a thread. A busy thread gets it as its next turn; nothing is interrupted.",
+    "Send a message to a thread. A busy thread gets it as its next turn; nothing is interrupted. An idle Claude thread over 200K tokens whose prompt cache expired runs /compact first, as the app does.",
   ),
   Command.withHandler((flags) =>
     Effect.gen(function* () {
@@ -780,7 +780,13 @@ const threadSendCommand = Command.make("send", {
           }
           yield* flags.json
             ? printJson(sent)
-            : Console.log(sent.delivery === "queued" ? "Queued." : "Sent.");
+            : Console.log(
+                sent.compactedFirst === true
+                  ? "Compacting first, then queued."
+                  : sent.delivery === "queued"
+                    ? "Queued."
+                    : "Sent.",
+              );
         }),
       );
     }).pipe(reportThreadErrors),

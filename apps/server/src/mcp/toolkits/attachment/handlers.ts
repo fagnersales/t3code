@@ -105,6 +105,7 @@ export const layer = McpToolAccess.toLayer(
               mode: "auto",
               createdBy: "agent",
               creationSource: "mcp",
+              compactIfCold: true,
             }).pipe(
               Effect.mapError((error) =>
                 error._tag === "AttachmentClaimError"
@@ -120,6 +121,7 @@ export const layer = McpToolAccess.toLayer(
               messageId,
               runId: result.run.id,
               status: result.run.status,
+              ...(result.compactedFirst ? { compactedFirst: true } : {}),
             };
           }),
       ),

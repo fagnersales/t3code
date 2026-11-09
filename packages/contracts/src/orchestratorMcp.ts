@@ -520,6 +520,12 @@ export const OrchestratorMcpThreadSendResult = Schema.Struct({
   taskId: Schema.optional(NodeId),
   status: OrchestrationV2RunStatus,
   delivery: Schema.Literals(["started", "queued", "steered", "restarted"]),
+  compactedFirst: Schema.optional(
+    Schema.Boolean.annotate({
+      description:
+        "True when the thread was a big Claude session whose prompt cache had expired, so a /compact run started first and the message queued behind it.",
+    }),
+  ),
 });
 export type OrchestratorMcpThreadSendResult = typeof OrchestratorMcpThreadSendResult.Type;
 
