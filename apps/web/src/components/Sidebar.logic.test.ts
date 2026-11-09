@@ -9,6 +9,8 @@ import {
   archiveSelectedThreadEntries,
   deleteSelectedThreadEntries,
   getFallbackThreadIdAfterDelete,
+  groupedSidebarThreadKeys,
+  hideGroupedSidebarThreads,
   hasUnseenCompletion,
   resolveSidebarRowThreadId,
   orderItemsByPreferredIds,
@@ -1445,5 +1447,63 @@ describe("resolveSidebarFolderDot", () => {
     expect(resolveSidebarFolderDot([idle, working])).toBe("working");
     expect(resolveSidebarFolderDot([working, unread])).toBe("unread");
     expect(resolveSidebarFolderDot([unread, limited])).toBe("attention");
+  });
+});
+
+describe("grouped sidebar threads", () => {
+  const environmentId = EnvironmentId.make("environment-groups");
+  const keyOf = (environment: EnvironmentId, threadId: ThreadId) => `${environment}:${threadId}`;
+  const rowKey = (thread: { environmentId: EnvironmentId; id: ThreadId }) =>
+    keyOf(thread.environmentId, thread.id);
+  const mine = makeThreadFixture({ id: ThreadId.make("thread-mine"), environmentId });
+  const hq = makeThreadFixture({ id: ThreadId.make("thread-hq"), environmentId });
+  const hqOpen = makeThreadFixture({ id: ThreadId.make("thread-hq-open"), environmentId });
+  const hqChild = makeThreadFixture({
+    id: ThreadId.make("thread-hq-child"),
+    environmentId,
+    lineage: { rootThreadId: hq.id, parentThreadId: hq.id, relationshipToParent: "subagent" },
+  });
+  const grouped = groupedSidebarThreadKeys(
+    new Map([
+      [
+        environmentId,
+        { settings: { threadGroups: { Headquarters: [hq.id, hqOpen.id, hqChild.id] } } },
+      ],
+    ]),
+    keyOf,
+  );
+  const threads = [mine, hq, hqOpen, hqChild];
+
+  it("keys every grouped thread by its sidebar row with its group", () => {
+    expect([...grouped]).toEqual([
+      [rowKey(hq), "Headquarters"],
+      [rowKey(hqOpen), "Headquarters"],
+      [rowKey(hqChild), "Headquarters"],
+    ]);
+  });
+
+  it("hides grouped threads but the open one, and counts only rows of their own", () => {
+    const result = hideGroupedSidebarThreads({
+      threads,
+      grouped,
+      show: false,
+      openKey: rowKey(hqOpen),
+      delegatedUnderParent: new Set(),
+      keyOf: rowKey,
+    });
+    expect(result.threads.map((thread) => thread.id)).toEqual([mine.id, hqOpen.id]);
+    expect(result.hidden).toBe(1);
+  });
+
+  it("lists everything when the groups are shown", () => {
+    const result = hideGroupedSidebarThreads({
+      threads,
+      grouped,
+      show: true,
+      openKey: null,
+      delegatedUnderParent: new Set(),
+      keyOf: rowKey,
+    });
+    expect(result).toEqual({ threads, hidden: 0 });
   });
 });

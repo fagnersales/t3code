@@ -154,6 +154,7 @@ import * as ThreadFeed from "./threadFeed/ThreadFeed.ts";
 import * as ThreadFeedHttp from "./threadFeed/http.ts";
 import * as ProjectFeed from "./projectFeed/ProjectFeed.ts";
 import * as ProjectFeedHttp from "./projectFeed/http.ts";
+import * as ThreadGroupsHttp from "./threadGroups/http.ts";
 import * as CloudLink from "./cloud/CloudLink.ts";
 import * as ConnectReachability from "./cloud/ConnectReachability.ts";
 import { pendingServiceUpdateExists } from "./cloud/updateHandoff.ts";
@@ -738,6 +739,7 @@ const layerMakeRoutes = Layer.mergeAll(
     GuestHttp.layer,
     ThreadFeedHttp.layer.pipe(Layer.provide(ThreadFeed.layer)),
     ProjectFeedHttp.layer.pipe(Layer.provide(ProjectFeed.layer)),
+    ThreadGroupsHttp.layer,
     DeviceHubProxy.layer,
     ServerBrowserStream.routeLayer,
     ServerHttp.layerStaticAndDevRoute,

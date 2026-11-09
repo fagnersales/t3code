@@ -1145,6 +1145,9 @@ export const StorageCleanupSettings = Schema.Struct({
 });
 export type StorageCleanupSettings = typeof StorageCleanupSettings.Type;
 
+export const ThreadGroups = Schema.Record(TrimmedNonEmptyString, Schema.Array(ThreadId));
+export type ThreadGroups = typeof ThreadGroups.Type;
+
 export const ServerSettings = Schema.Struct({
   // Null means unmigrated; empty is authoritative and must not resurrect cleared preferences.
   favorites: Schema.NullOr(ModelFavorites).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
@@ -1324,6 +1327,12 @@ export const ServerSettings = Schema.Struct({
   usageModelAliases: Schema.Record(TrimmedNonEmptyString, TrimmedNonEmptyString).pipe(
     Schema.withDecodingDefault(Effect.succeed({})),
   ),
+
+  /**
+   * Fork: named sets of threads another app runs here, such as "Headquarters". The sidebar hides
+   * a set's threads until the user shows that set. Written by `t3 thread group`.
+   */
+  threadGroups: ThreadGroups.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
 });
 export type ServerSettings = typeof ServerSettings.Type;
 
@@ -1634,6 +1643,10 @@ export const ServerSettingsPatch = Schema.Struct({
 
   usageModelAliases: Schema.optionalKey(
     Schema.Record(TrimmedNonEmptyString, Schema.NullOr(TrimmedNonEmptyString)),
+  ),
+  // A group's list replaces the saved one; null removes the group.
+  threadGroups: Schema.optionalKey(
+    Schema.Record(TrimmedNonEmptyString, Schema.NullOr(Schema.Array(ThreadId))),
   ),
 });
 export type ServerSettingsPatch = typeof ServerSettingsPatch.Type;

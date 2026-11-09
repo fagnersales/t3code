@@ -591,6 +591,60 @@ export function filterSidebarV2VisibleThreads<
   );
 }
 
+/**
+ * Fork: the threads the server settings' `threadGroups` name, such as the ones Headquarters runs,
+ * keyed like sidebar rows, with their group's name.
+ */
+export function groupedSidebarThreadKeys(
+  serverConfigs: ReadonlyMap<
+    EnvironmentId,
+    { readonly settings: { readonly threadGroups?: Readonly<Record<string, readonly ThreadId[]>> } }
+  >,
+  keyOf: (environmentId: EnvironmentId, threadId: ThreadId) => string,
+): ReadonlyMap<string, string> {
+  const grouped = new Map<string, string>();
+  for (const [environmentId, config] of serverConfigs) {
+    for (const [group, threadIds] of Object.entries(config.settings.threadGroups ?? {})) {
+      for (const threadId of threadIds) grouped.set(keyOf(environmentId, threadId), group);
+    }
+  }
+  return grouped;
+}
+
+/**
+ * Leaves out grouped threads unless they are shown, except the open one. `hidden` counts the rows
+ * left out; a thread shown under its parent has no row of its own.
+ */
+export function hideGroupedSidebarThreads<
+  T extends Pick<SidebarThreadSummary, "archivedAt" | "environmentId" | "id" | "lineage">,
+>(input: {
+  readonly threads: readonly T[];
+  readonly grouped: ReadonlyMap<string, string>;
+  readonly show: boolean;
+  readonly openKey: string | null;
+  readonly delegatedUnderParent: ReadonlySet<string>;
+  readonly keyOf: (thread: T) => string;
+}): { readonly threads: readonly T[]; readonly hidden: number } {
+  const { threads, grouped, show, openKey, delegatedUnderParent, keyOf } = input;
+  if (show || grouped.size === 0) return { threads, hidden: 0 };
+  let hidden = 0;
+  const visible = threads.filter((thread) => {
+    const key = keyOf(thread);
+    if (!grouped.has(key) || key === openKey) return true;
+    if (
+      thread.archivedAt === null &&
+      !isShownUnderParent(
+        { environmentId: thread.environmentId, threadId: thread.id },
+        thread.lineage,
+        delegatedUnderParent,
+      )
+    )
+      hidden += 1;
+    return false;
+  });
+  return { threads: visible, hidden };
+}
+
 export function buildBulkTitleRegenerationContextMenuItem(input: {
   supportedCount: number;
   actionableCount: number;
