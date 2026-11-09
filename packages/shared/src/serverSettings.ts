@@ -360,6 +360,7 @@ export function applyServerSettingsPatch(
     sourceControlHosts: sourceControlHostsPatch,
     usagePriceOverrides: usagePriceOverridesPatch,
     usageModelAliases: usageModelAliasesPatch,
+    threadGroups: threadGroupsPatch,
     // Entry replacement: deepMerge would keep keys the client meant to clear.
     projectSettingsOverrides: projectSettingsOverridesPatch,
     projectAgentBrowserAccessOverrides: _legacyBrowserAccess,
@@ -567,6 +568,16 @@ export function applyServerSettingsPatch(
           usageModelAliases: mergeSettingsEntries(
             current.usageModelAliases,
             usageModelAliasesPatch,
+          ),
+        }
+      : {}),
+    // deepMerge would merge a group's list with the saved one instead of replacing it.
+    ...(threadGroupsPatch !== undefined
+      ? {
+          threadGroups: Object.fromEntries(
+            Object.entries(mergeSettingsEntries(current.threadGroups, threadGroupsPatch)).filter(
+              ([, threadIds]) => threadIds.length > 0,
+            ),
           ),
         }
       : {}),

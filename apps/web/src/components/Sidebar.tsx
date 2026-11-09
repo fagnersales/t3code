@@ -63,6 +63,8 @@ import type { OlderSettledScope } from "@t3tools/client-runtime/state/threads";
 import {
   CheckIcon,
   ChevronDownIcon,
+  EyeIcon,
+  EyeOffIcon,
   FolderIcon,
   ListFilterIcon,
   PlusIcon,
@@ -173,6 +175,8 @@ import {
   applySidebarThreadDrop,
   filterSidebarV2VisibleThreads,
   groupSidebarThreadsByProject,
+  groupedSidebarThreadKeys,
+  hideGroupedSidebarThreads,
   sidebarFolderExpansionKeys,
   buildBulkTitleRegenerationContextMenuItem,
   buildBulkUnpinContextMenuItem,
@@ -319,6 +323,7 @@ const SETTLED_TAIL_PAGE_COUNT = 25;
 const SETTLED_SHELF_EXPANDED_KEY = "t3code:sidebar:settled-expanded";
 const SNOOZED_SHELF_EXPANDED_KEY = "t3code:sidebar:snoozed-expanded";
 const WORKING_SHELF_EXPANDED_KEY = "t3code:sidebar:working-expanded";
+const SHOW_GROUPED_THREADS_KEY = "t3code:sidebar:show-thread-groups";
 
 const inboxReturns = createInboxReturnTracker();
 
@@ -1084,6 +1089,23 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
           ),
         );
   const isSearchingThreads = threadSearchQuery.trim().length > 0;
+  const [showGroupedThreads, setShowGroupedThreads] = useLocalStorage(
+    SHOW_GROUPED_THREADS_KEY,
+    false,
+    Schema.Boolean,
+  );
+  const groupedThreadKeys = groupedSidebarThreadKeys(serverConfigs, (environmentId, threadId) =>
+    scopedThreadKey(scopeThreadRef(environmentId, threadId)),
+  );
+  const threadGroupNames = [...new Set(groupedThreadKeys.values())].toSorted().join(", ");
+  const { threads: listedThreads, hidden: hiddenGroupedThreadCount } = hideGroupedSidebarThreads({
+    threads,
+    grouped: groupedThreadKeys,
+    show: showGroupedThreads,
+    openKey: routeRowThreadKey,
+    delegatedUnderParent,
+    keyOf: threadShellKey,
+  });
 
   // History, the palette and links can open a thread the scope hides or the list
   // scrolled away; a remount starts at the top, so each mount scrolls to the open
@@ -1278,7 +1300,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
     scopedProjectKeys,
     serverConfigs,
     optimisticDrop,
-    threads,
+    threads: listedThreads,
     delegatedUnderParent,
     routeRowThreadKey,
     folderGroups: boringSidebarEnabled
@@ -3065,6 +3087,27 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                     </ComboboxList>
                   </ComboboxPopup>
                 </Combobox>
+              }
+              threadGroupsToggle={
+                threadGroupNames === "" ? null : (
+                  <SidebarHeaderIconButton
+                    label={
+                      showGroupedThreads
+                        ? `Hide ${threadGroupNames} threads`
+                        : `Show ${threadGroupNames} threads (${hiddenGroupedThreadCount} hidden)`
+                    }
+                    aria-pressed={showGroupedThreads}
+                    data-testid="sidebar-thread-groups-toggle"
+                    onClick={() => setShowGroupedThreads((shown) => !shown)}
+                  >
+                    {showGroupedThreads ? <EyeIcon /> : <EyeOffIcon />}
+                    {!showGroupedThreads && hiddenGroupedThreadCount > 0 ? (
+                      <span className="pointer-events-none absolute -top-0.5 -right-0.5 min-w-3.5 rounded-full bg-accent px-0.5 text-center text-3xs leading-3.5 font-medium tabular-nums text-foreground/80">
+                        {hiddenGroupedThreadCount}
+                      </span>
+                    ) : null}
+                  </SidebarHeaderIconButton>
+                )
               }
               onNewProject={openAddProjectCommandPalette}
               onNewThread={handleNewThreadClick}

@@ -43,6 +43,7 @@ export * from "./applicationEvent.ts";
 export * from "./orchestratorMcp.ts";
 export * from "./threadFeed.ts";
 export * from "./projectFeed.ts";
+export * from "./threadGroups.ts";
 export * from "./peerLink.ts";
 export * from "./threadMetadataMcp.ts";
 export * from "./threadPullRequest.ts";

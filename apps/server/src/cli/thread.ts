@@ -37,6 +37,7 @@ import { expandHomePath } from "../os-jank.ts";
 import { readPersistedServerRuntimeState } from "../serverRuntimeState.ts";
 import { projectLocationFlags, resolveCliAuthConfig } from "./config.ts";
 import { threadFollowCommand } from "./threadFollow.ts";
+import { threadGroupCommand } from "./threadGroup.ts";
 
 /**
  * Short enough that a run which stops to ask the user something is noticed
@@ -855,5 +856,6 @@ export const threadCommand = Command.make("thread").pipe(
     threadSendCommand,
     threadShowCommand,
     threadFollowCommand,
+    threadGroupCommand,
   ]),
 );

@@ -14,6 +14,11 @@ Fagner's T3 Code: the Nightly he ran, plus live thread and project feeds for Hea
   [thread-feed.md](thread-feed.md).
 - **Project feed:** `t3 project follow` and `GET /api/project-feed/v1`, a project's threads live
   (created, running, waiting, settled, archived, deleted), see [project-feed.md](project-feed.md).
+- **Thread groups:** `t3 thread group <name> <thread>…` (and `POST /api/thread-groups/v1`) sets
+  the threads of a named group in the server settings' `threadGroups`. The sidebar hides them
+  until the eye button in its header shows them; the open thread always stays listed.
+  Headquarters keeps its group, `Headquarters`, equal to the threads it follows. A settings key,
+  not a migration: an older build ignores it.
 - **Build identity:** versions `<nightly>-fagner.N`, app name `T3 Code (Fagner)`, no update feed
   (the updater reports updates as unavailable, so nothing can replace it with upstream).
 
@@ -25,13 +30,15 @@ backup.
 
 | Script            | Does                                                                                                                                                     |
 | ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `build`           | Builds `T3 Code (Fagner).app` with its `t3` CLI into `~/work/t3code-fagner-builds.noindex/<version>/`, ad-hoc signs it, points `latest` at it.           |
+| `build`           | Builds `T3 Code (Fagner).app` with its `t3` CLI into `~/work/t3code-fagner-builds.noindex/<version>/`, signs it, points `latest` at it.                  |
 | `install --quit`  | Quits T3 gracefully, keeps the running Nightly for rollback, puts the newest build in `/Applications`, points `~/.t3/bin/t3` at it, relaunches.          |
 | `rollback --quit` | The reverse: puts the kept Nightly back, points `t3` at it, relaunches it.                                                                               |
+| `setup-signing`   | Makes the local certificate `build` signs with, once. macOS then takes every build for the same app and keeps the permissions granted to it.             |
 | `update`          | Fetches upstream, merges the newest Nightly tag into `fagner/main` (stops if it adds migrations, unless `--accept-migrations`), installs, tests, builds. |
 
 `install` and `rollback` never copy or open the database. Run without `--quit`, they refuse while
-T3 is running. With it, they detach into their own session (so quitting T3 and its terminals
+T3 is running. They reopen T3 with the environment the Dock gives it and open it again if it quits
+within seconds. With `--quit`, they detach into their own session (so quitting T3 and its terminals
 cannot stop them), send T3 the same SIGTERM its own Quit path handles, wait up to 3 minutes for
 it to exit (never force), wait for a pending Nightly update install (ShipIt) to finish, then swap.
 Logs: `~/Library/Logs/t3code-fagner/`.

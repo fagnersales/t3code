@@ -16,6 +16,8 @@ export interface SidebarThreadHeaderProps {
   searchFieldRef?: RefObject<HTMLDivElement | null>;
   hasProjects: boolean;
   projectScope: ReactNode;
+  /** Fork: shows or hides the threads of `threadGroups`; null when there are none. */
+  threadGroupsToggle?: ReactNode;
   onNewProject: () => void;
   onNewThread: (event: ReactMouseEvent) => void;
   newThreadDisabled: boolean;
@@ -36,6 +38,7 @@ export function SidebarThreadHeader({
   searchFieldRef,
   hasProjects,
   projectScope,
+  threadGroupsToggle = null,
   onNewProject,
   onNewThread,
   newThreadDisabled,
@@ -102,6 +105,7 @@ export function SidebarThreadHeader({
         ) : null}
       </div>
       <div className="flex shrink-0 items-center">
+        {threadGroupsToggle}
         {hasProjects ? (
           <>
             {projectScope}

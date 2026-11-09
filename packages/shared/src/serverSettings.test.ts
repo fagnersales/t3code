@@ -3,6 +3,7 @@ import {
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
+  ThreadId,
   UsageLimitSourceId,
   type ServerProvider,
 } from "@t3tools/contracts";
@@ -896,5 +897,34 @@ describe("synchronized model preferences", () => {
         setModelFavorites: [{ provider, model: "sol", favorite: false }],
       }).favorites,
     ).toEqual([{ provider: otherProvider, model: "sol" }]);
+  });
+});
+
+describe("threadGroups", () => {
+  const a = ThreadId.make("thread-a");
+  const b = ThreadId.make("thread-b");
+  const c = ThreadId.make("thread-c");
+  const saved = applyServerSettingsPatch(DEFAULT_SERVER_SETTINGS, {
+    threadGroups: { Headquarters: [a, b], Other: [c] },
+  });
+
+  it("replaces one group's list and keeps the others", () => {
+    const next = applyServerSettingsPatch(saved, { threadGroups: { Headquarters: [c] } });
+    expect(next.threadGroups).toEqual({ Headquarters: [c], Other: [c] });
+  });
+
+  it("removes a group set to null or to no threads", () => {
+    expect(applyServerSettingsPatch(saved, { threadGroups: { Other: null } }).threadGroups).toEqual(
+      { Headquarters: [a, b] },
+    );
+    expect(applyServerSettingsPatch(saved, { threadGroups: { Other: [] } }).threadGroups).toEqual({
+      Headquarters: [a, b],
+    });
+  });
+
+  it("leaves the groups alone when a patch does not name them", () => {
+    expect(applyServerSettingsPatch(saved, { idleCompaction: "off" }).threadGroups).toEqual(
+      saved.threadGroups,
+    );
   });
 });
