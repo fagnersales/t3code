@@ -104,6 +104,7 @@ const iso = (value: DateTime.Utc | null | undefined) =>
 const toFeedThread = (
   shell: OrchestrationV2ThreadShell,
   pendingRequests: number,
+  launchedByThreadId: ThreadId | null,
   nowMs: number,
 ): ProjectFeedThread => {
   const snoozed = isSnoozed(shell, nowMs);
@@ -143,6 +144,7 @@ const toFeedThread = (
     archivedAt: iso(shell.archivedAt),
     parentThreadId: shell.lineage.parentThreadId,
     relationshipToParent: shell.lineage.relationshipToParent,
+    launchedByThreadId,
     createdBy: shell.createdBy,
     creationSource: shell.creationSource,
     providerInstanceId: shell.modelSelection.instanceId,
@@ -184,6 +186,7 @@ export const diffThreads = (
   ) {
     changes.push("parent");
   }
+  if (previous.launchedByThreadId !== next.launchedByThreadId) changes.push("launcher");
   if (previous.model !== next.model || previous.providerInstanceId !== next.providerInstanceId) {
     changes.push("model");
   }
@@ -305,6 +308,31 @@ export const make = Effect.fn("ProjectFeed.make")(function* (source: ProjectFeed
     return counts;
   });
 
+  // The first message's sender, one seek per thread on (thread_id, created_at, message_id). A
+  // launch commits the thread before its message, so a thread's first line may still say null.
+  const readLaunchers = Effect.fn("ProjectFeed.readLaunchers")(function* (
+    threadIds: ReadonlyArray<string>,
+  ) {
+    const launchers = new Map<string, ThreadId>();
+    for (const ids of chunks(threadIds)) {
+      const rows = yield* sql<{ thread_id: string; sender: string | null }>`
+        SELECT t.thread_id, (
+          SELECT CASE WHEN m.role = 'user'
+            THEN json_extract(m.payload_json, '$.senderThreadId') END
+          FROM orchestration_v2_projection_messages m
+          WHERE m.thread_id = t.thread_id
+          ORDER BY m.created_at, m.message_id
+          LIMIT 1
+        ) AS sender
+        FROM orchestration_v2_projection_threads t
+        WHERE t.thread_id IN ${sql.in(ids)}`;
+      for (const row of rows) {
+        if (row.sender !== null) launchers.set(row.thread_id, row.sender as ThreadId);
+      }
+    }
+    return launchers;
+  });
+
   const readThreads = Effect.fn("ProjectFeed.readThreads")(function* (input: {
     readonly projectId: ProjectId;
     readonly threadIds?: ReadonlyArray<ThreadId>;
@@ -319,10 +347,16 @@ export const make = Effect.fn("ProjectFeed.make")(function* (source: ProjectFeed
     const pending = yield* readPendingCounts(
       shells.filter((shell) => shell.pendingRuntimeRequest !== null).map((shell) => shell.id),
     );
+    const launchers = yield* readLaunchers(shells.map((shell) => shell.id));
     const nowMs = yield* Clock.currentTimeMillis;
     return shells.map((shell) => ({
       shell,
-      thread: toFeedThread(shell, pending.get(shell.id) ?? 0, nowMs),
+      thread: toFeedThread(
+        shell,
+        pending.get(shell.id) ?? 0,
+        launchers.get(shell.id) ?? null,
+        nowMs,
+      ),
     }));
   });
 

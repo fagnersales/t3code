@@ -1,5 +1,7 @@
 import { assert, it } from "@effect/vitest";
+import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import {
+  MessageId,
   type OrchestrationV2AppThread,
   type ProjectFeedEvent,
   type ProjectFeedThread,
@@ -14,6 +16,7 @@ import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import { TestClock } from "effect/testing";
 
+import * as EventSink from "../orchestration-v2/EventSink.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import {
   assistantMessage,
@@ -110,6 +113,48 @@ const threadOf = (events: ReadonlyArray<ProjectFeedEvent>, title: string) =>
   )[0];
 
 const now = DateTime.now;
+
+/** What a launch's `message.dispatch` commits: the first message and its run, together. */
+const writeFirstMessage = Effect.fn("test.writeFirstMessage")(function* (
+  thread: OrchestrationV2AppThread,
+  senderThreadId: OrchestrationV2AppThread["id"] | undefined,
+) {
+  const ids = yield* IdAllocator.IdAllocatorV2;
+  const sink = yield* EventSink.EventSinkV2;
+  const t = yield* now;
+  yield* sink.write({
+    events: [
+      {
+        id: yield* ids.allocate.event({ threadId: thread.id }),
+        type: "message.updated",
+        threadId: thread.id,
+        occurredAt: t,
+        payload: {
+          id: MessageId.make(`${thread.id}:first`),
+          threadId: thread.id,
+          runId: null,
+          nodeId: null,
+          role: "user",
+          text: "Build it",
+          attachments: [],
+          streaming: false,
+          createdBy: "agent",
+          creationSource: "mcp",
+          ...(senderThreadId === undefined ? {} : { senderThreadId }),
+          createdAt: t,
+          updatedAt: t,
+        },
+      },
+      {
+        id: yield* ids.allocate.event({ threadId: thread.id }),
+        type: "run.updated",
+        threadId: thread.id,
+        occurredAt: t,
+        payload: run(thread.id, 1, "running", t),
+      },
+    ],
+  });
+});
 
 const seed = Effect.fn("test.seed")(function* (projectId: ProjectId, title: string) {
   return yield* seedThreadRecord(title, { projectId });
@@ -233,6 +278,37 @@ layer("ProjectFeed", (it) => {
     ),
   );
 
+  it.effect("names the thread whose agent launched it, from the first message's sender", () =>
+    live(
+      Effect.gen(function* () {
+        const projectId = newProject();
+        const marker = yield* seed(projectId, "Marker");
+        const lead = yield* seed(projectId, "Lead");
+        const events = yield* follow({ ref: projectId });
+        yield* takeThrough(events, "ready");
+
+        // A launch commits the thread first, then its message with the run.
+        const job = yield* seed(projectId, "Job");
+        const created = yield* drain(events, marker);
+        assert.deepEqual(created.map(summary), ["thread Job idle [created]"]);
+        assert.isNull(threadOf(created, "Job")?.launchedByThreadId);
+        yield* writeFirstMessage(job, lead.id);
+        const launched = yield* drain(events, marker);
+        assert.deepEqual(launched.map(summary), ["thread Job running [status,run,launcher]"]);
+        assert.equal(threadOf(launched, "Job")?.launchedByThreadId, lead.id);
+
+        const byPerson = yield* seed(projectId, "By hand");
+        yield* writeFirstMessage(byPerson, undefined);
+        yield* drain(events, marker);
+
+        const snapshot = yield* takeThrough(yield* follow({ ref: projectId }), "ready");
+        assert.equal(threadOf(snapshot, "Job")?.launchedByThreadId, lead.id);
+        assert.isNull(threadOf(snapshot, "Lead")?.launchedByThreadId);
+        assert.isNull(threadOf(snapshot, "By hand")?.launchedByThreadId);
+      }),
+    ),
+  );
+
   it.effect("resumes from a position with only the threads changed after it", () =>
     live(
       Effect.gen(function* () {
@@ -307,6 +383,7 @@ it.effect("diffThreads names the fields a reader acts on, never updatedAt alone"
       archivedAt: null,
       parentThreadId: null,
       relationshipToParent: null,
+      launchedByThreadId: null,
       createdBy: "user",
       creationSource: "web",
       providerInstanceId: "codex",
@@ -324,8 +401,9 @@ it.effect("diffThreads names the fields a reader acts on, never updatedAt alone"
         snoozed: true,
         branch: "fix",
         worktreePath: "/w",
+        launchedByThreadId: "lead",
       }),
-      ["title", "snoozed", "branch", "worktree"],
+      ["title", "snoozed", "launcher", "branch", "worktree"],
     );
   }),
 );

@@ -54,6 +54,12 @@ export const ProjectFeedThread = Schema.Struct({
   archivedAt: Schema.NullOr(Schema.String),
   parentThreadId: Schema.NullOr(Schema.String),
   relationshipToParent: Schema.NullOr(Schema.Literals(["fork", "subagent"])),
+  /**
+   * The thread whose agent opened this one with its first message (`t3_thread_launch` from a
+   * thread), or null: a person, `t3 thread start`, or a thread T3 started itself. Subagents and
+   * forks name theirs in `parentThreadId` instead.
+   */
+  launchedByThreadId: Schema.NullOr(Schema.String),
   createdBy: Schema.String,
   creationSource: Schema.String,
   providerInstanceId: Schema.String,
@@ -76,6 +82,7 @@ export const ProjectFeedChange = Schema.Literals([
   "snoozed",
   "archived",
   "parent",
+  "launcher",
   "model",
   "branch",
   "worktree",

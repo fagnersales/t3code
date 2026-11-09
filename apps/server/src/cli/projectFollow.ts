@@ -126,6 +126,7 @@ const formatText = (event: ProjectFeedEvent): string | null => {
         thread.parentThreadId === null
           ? null
           : `${thread.relationshipToParent ?? "child"} of ${thread.parentThreadId}`,
+        thread.launchedByThreadId === null ? null : `launched by ${thread.launchedByThreadId}`,
       ].filter((flag) => flag !== null);
       return `${thread.threadId}  ${thread.status.padEnd(11)}  ${thread.title}${
         flags.length === 0 ? "" : `  (${flags.join(", ")})`
