@@ -84,6 +84,17 @@ quit_t3_gracefully() {
   fi
 }
 
+# `open` hands the app this script's environment. Run from a T3 chat, that has
+# ELECTRON_RUN_AS_NODE=1, and the app starts as a bare Node and exits at once; so give it only what
+# launchd gives an app opened from the Dock.
+open_like_dock() {
+  local agent
+  agent="$(/bin/launchctl getenv SSH_AUTH_SOCK 2>/dev/null || true)"
+  /usr/bin/env -i HOME="$HOME" USER="$USER" LOGNAME="${LOGNAME:-$USER}" SHELL="${SHELL:-/bin/zsh}" \
+    TMPDIR="${TMPDIR:-/tmp/}" PATH=/usr/bin:/bin:/usr/sbin:/sbin ${agent:+SSH_AUTH_SOCK="$agent"} \
+    /usr/bin/open "$1"
+}
+
 # Open the app and make sure it stays open: right after the old copy quits, a new one can quit
 # again within seconds, so try again a few times.
 LAUNCH_SETTLE_SECONDS=10
@@ -92,7 +103,7 @@ launch_app() {
   local app="$1" name attempt
   name="$(basename "$app" .app)"
   for attempt in $(seq 1 "$LAUNCH_ATTEMPTS"); do
-    /usr/bin/open "$app"
+    open_like_dock "$app"
     sleep "$LAUNCH_SETTLE_SECONDS"
     if [ -n "$(running_app_pids)" ]; then
       log "Launched $name"
