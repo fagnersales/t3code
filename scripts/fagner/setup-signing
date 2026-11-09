@@ -1,0 +1,48 @@
+#!/bin/bash
+# Make the local certificate that signs every fork build, once, and print its SHA-1.
+#
+#   scripts/fagner/setup-signing
+#
+# An ad-hoc signature changes with every build, so macOS takes each build for a new app and drops
+# the permissions granted to the last one (Accessibility, Screen Recording, Automation). Builds
+# signed with one certificate stay the same app to macOS. The certificate lives in its own keychain
+# with an empty password, so a build never asks for one.
+set -euo pipefail
+source "$(dirname "$0")/lib.sh"
+
+if [ ! -f "$SIGNING_KEYCHAIN" ]; then
+  work="$(mktemp -d)"
+  trap 'rm -rf "$work"' EXIT
+  cat >"$work/certificate.cnf" <<CNF
+[req]
+distinguished_name = subject
+x509_extensions = extensions
+prompt = no
+[subject]
+CN = $SIGNING_IDENTITY
+[extensions]
+basicConstraints = critical,CA:false
+keyUsage = critical,digitalSignature
+extendedKeyUsage = critical,codeSigning
+CNF
+  /usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -config "$work/certificate.cnf" \
+    -keyout "$work/key.pem" -out "$work/certificate.pem" 2>/dev/null
+  /usr/bin/openssl pkcs12 -export -inkey "$work/key.pem" -in "$work/certificate.pem" \
+    -out "$work/identity.p12" -passout pass:import
+
+  security create-keychain -p "" "$SIGNING_KEYCHAIN"
+  security set-keychain-settings "$SIGNING_KEYCHAIN"
+  security unlock-keychain -p "" "$SIGNING_KEYCHAIN"
+  security import "$work/identity.p12" -k "$SIGNING_KEYCHAIN" -P import -T /usr/bin/codesign >/dev/null
+  security set-key-partition-list -S apple-tool:,apple: -s -k "" "$SIGNING_KEYCHAIN" >/dev/null
+  log "Created $SIGNING_IDENTITY in $SIGNING_KEYCHAIN" >&2
+fi
+
+# codesign finds an untrusted identity only in a keychain on the search list.
+searched="$(security list-keychains -d user | tr -d '" ')"
+if ! printf '%s\n' "$searched" | grep -qxF "$SIGNING_KEYCHAIN"; then
+  # shellcheck disable=SC2086
+  security list-keychains -d user -s $searched "$SIGNING_KEYCHAIN"
+fi
+security unlock-keychain -p "" "$SIGNING_KEYCHAIN"
+security find-certificate -c "$SIGNING_IDENTITY" -Z "$SIGNING_KEYCHAIN" | awk '/SHA-1/ { print $3 }'

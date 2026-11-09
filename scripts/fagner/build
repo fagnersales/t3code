@@ -4,7 +4,8 @@
 #   scripts/fagner/build [--version 0.1.5-nightly.20261029.3877-fagner.2] [--arch arm64]
 #
 # The version defaults to the Nightly tag this checkout is based on plus the next free
-# -fagner.N. Output: $FAGNER_BUILDS_DIR/<version>/T3 Code (Fagner).app, ad-hoc signed, and the
+# -fagner.N. Output: $FAGNER_BUILDS_DIR/<version>/T3 Code (Fagner).app, signed with the local
+# certificate from scripts/fagner/setup-signing (T3_FAGNER_SIGN_IDENTITY=- for ad-hoc), and the
 # `latest` link pointing at it. Builds without an update feed, so the app never updates itself.
 set -euo pipefail
 source "$(dirname "$0")/lib.sh"
@@ -61,10 +62,15 @@ app="$out/$FAGNER_APP_NAME.app"
 [ ! -e "$app/Contents/Resources/app-update.yml" ] || die "The build has an update feed (app-update.yml)"
 [ -f "$app/Contents/Resources/app.asar" ] || die "No app.asar in the build"
 
-identity="${T3_FAGNER_SIGN_IDENTITY:--}"
-/usr/bin/codesign --force --deep --sign "$identity" "$app"
+if [ -n "${T3_FAGNER_SIGN_IDENTITY:-}" ]; then
+  identity="$T3_FAGNER_SIGN_IDENTITY"
+  /usr/bin/codesign --force --deep --sign "$identity" "$app"
+else
+  identity="$("$FAGNER_REPO_ROOT/scripts/fagner/setup-signing")"
+  /usr/bin/codesign --force --deep --keychain "$SIGNING_KEYCHAIN" --sign "$identity" "$app"
+fi
 /usr/bin/codesign --verify --deep --strict "$app"
-log "Signed with identity '$identity' (- is ad-hoc)"
+log "Signed with identity '$identity' (- is ad-hoc). macOS knows it as: $(/usr/bin/codesign -dr - "$app" 2>&1 | sed -n 's/^designated => //p')"
 
 ELECTRON_RUN_AS_NODE=1 "$app/Contents/MacOS/$FAGNER_APP_NAME" \
   "$app/Contents/Resources/app.asar/apps/server/dist/bin.mjs" --version

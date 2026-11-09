@@ -13,6 +13,8 @@ NIGHTLY_APP="$APPS_DIR/$NIGHTLY_APP_NAME.app"
 APP_BUNDLE_ID="${T3_FAGNER_BUNDLE_ID:-com.t3tools.t3code}"
 T3_HOME_DIR="${T3_FAGNER_T3_HOME:-$HOME/.t3}"
 CLI_SHIM="$T3_HOME_DIR/bin/t3"
+SIGNING_IDENTITY="T3 Code Fagner Local Signing"
+SIGNING_KEYCHAIN="$HOME/Library/Keychains/t3code-fagner-signing.keychain-db"
 
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 die() {
