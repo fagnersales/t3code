@@ -8,11 +8,16 @@ import {
   ProviderThreadId,
   ProviderTurnId,
   RunId,
+  RuntimeRequestId,
   ThreadId,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 
-import { idleCompactionWindow, type IdleCompactionRecords } from "./IdleCompaction.ts";
+import {
+  idleCompactionWindow,
+  shouldCompactBeforeSend,
+  type IdleCompactionRecords,
+} from "./IdleCompaction.ts";
 
 const NOW_MS = Date.parse("2026-10-19T12:00:00.000Z");
 const MINUTE_MS = 60_000;
@@ -24,7 +29,11 @@ const providerThreadId = ProviderThreadId.make("provider-thread");
 const modelSelection = { instanceId, model: "claude-opus-5-5" };
 
 function records(
-  usage: { readonly usedTokens?: number; readonly cacheExpiresInMs?: number } = {},
+  usage: {
+    readonly usedTokens?: number;
+    readonly cacheExpiresInMs?: number;
+    readonly reportedAgoMs?: number;
+  } = {},
 ): { -readonly [Key in keyof IdleCompactionRecords]: IdleCompactionRecords[Key] } {
   const messageId = MessageId.make("message-1");
   const nodeId = NodeId.make("root-node");
@@ -123,7 +132,7 @@ function records(
           ...(usage.cacheExpiresInMs === undefined
             ? {}
             : { promptCacheExpiresAt: DateTime.formatIso(at(usage.cacheExpiresInMs)) }),
-          updatedAt: DateTime.formatIso(at()),
+          updatedAt: DateTime.formatIso(at(-(usage.reportedAgoMs ?? 0))),
         },
       },
     ],
@@ -152,5 +161,71 @@ describe("idleCompactionWindow", () => {
     const archived = records(cache);
     archived.thread = { ...archived.thread, archivedAt: at() };
     expect(idleCompactionWindow(archived, NOW_MS)).toBeNull();
+  });
+});
+
+describe("shouldCompactBeforeSend", () => {
+  const send = {
+    text: "Next step",
+    mode: "onReturn" as const,
+    now: DateTime.formatIso(at()),
+  };
+  // Last usage report 71 minutes ago: past Claude's 1h cache plus slack.
+  const cold = () => records({ reportedAgoMs: 71 * MINUTE_MS });
+
+  it("compacts a big Claude session whose prompt cache expired", () => {
+    expect(shouldCompactBeforeSend(cold(), send)).toBe(true);
+    expect(shouldCompactBeforeSend(cold(), { ...send, mode: "beforeCacheExpires" })).toBe(true);
+    expect(shouldCompactBeforeSend(cold(), { ...send, instanceId })).toBe(true);
+  });
+
+  it("sends plainly to warm, small, opted-out, dismissed, busy, and non-Claude threads", () => {
+    expect(shouldCompactBeforeSend(records({ reportedAgoMs: 30 * MINUTE_MS }), send)).toBe(false);
+    expect(
+      shouldCompactBeforeSend(
+        records({ reportedAgoMs: 71 * MINUTE_MS, usedTokens: 199_999 }),
+        send,
+      ),
+    ).toBe(false);
+    expect(shouldCompactBeforeSend(cold(), { ...send, mode: "off" })).toBe(false);
+    expect(shouldCompactBeforeSend(cold(), { ...send, text: "/compact keep the plan" })).toBe(
+      false,
+    );
+    expect(
+      shouldCompactBeforeSend(cold(), {
+        ...send,
+        instanceId: ProviderInstanceId.make("codex"),
+      }),
+    ).toBe(false);
+
+    const dismissed = cold();
+    dismissed.runtimeRequests = [
+      {
+        id: RuntimeRequestId.make("request-1"),
+        nodeId: NodeId.make("root-node"),
+        providerTurnId: null,
+        nativeRequestRef: null,
+        kind: "user_input",
+        status: "resolved",
+        responseCapability: { type: "message" },
+        createdAt: at(-MINUTE_MS),
+        resolvedAt: at(-MINUTE_MS),
+        answers: {
+          "This session is 2h 0m old and uses 250,000 tokens. Compact it before continuing?":
+            "Don't ask again",
+        },
+      },
+    ];
+    expect(shouldCompactBeforeSend(dismissed, send)).toBe(false);
+
+    const busy = cold();
+    busy.runs = [...busy.runs, { ...busy.runs[0]!, id: RunId.make("run-2"), status: "queued" }];
+    expect(shouldCompactBeforeSend(busy, send)).toBe(false);
+
+    const codex = cold();
+    codex.providerThreads = [
+      { ...codex.providerThreads[0]!, driver: ProviderDriverKind.make("codex") },
+    ];
+    expect(shouldCompactBeforeSend(codex, send)).toBe(false);
   });
 });

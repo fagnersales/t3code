@@ -310,11 +310,11 @@ import type { ComposerBannerStackItem } from "./chat/ComposerBannerStack";
 import { modelFallbackBannerItem } from "./chat/ComposerUsageLimits";
 import { ComposerSurface } from "./chat/ComposerSurface";
 import { resolveThreadSyncPhase } from "../threadSync";
+import { hasAvailableCompactionProvider } from "./chat/ContextWindowMeter.logic";
 import {
-  hasAvailableCompactionProvider,
   hasDismissedResumeCompaction,
   shouldOfferResumeCompaction,
-} from "./chat/ContextWindowMeter.logic";
+} from "@t3tools/shared/claudeCompaction";
 import {
   deriveLatestContextWindowSnapshot,
   latestProviderTurnTokenUsage,
@@ -1640,12 +1640,7 @@ export default function ChatView(props: ChatViewProps) {
       Schema.Boolean,
     );
   const nativeResumeCompactionDismissed = hasDismissedResumeCompaction(
-    (serverProjection?.runtimeRequests ?? [])
-      .filter((request) => request.kind === "user_input" && request.status === "resolved")
-      .map((request) => ({
-        kind: "user-input.resolved",
-        payload: { answers: request.answers },
-      })),
+    serverProjection?.runtimeRequests ?? [],
   );
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- persists the server-reported resume compaction dismissal to localStorage
   useEffect(() => {
