@@ -14,7 +14,12 @@ import { discardResponseBody, responsePayloads } from "@t3tools/shared/mcpRespon
 
 export class AcpMcpBridgeError extends Error {
   readonly _tag = "AcpMcpBridgeError";
+  /** The JSON-RPC error code, when the server answered with an error. */
+  code?: number;
 }
+
+/** JSON-RPC's code for arguments the server's schema rejects. */
+export const JSON_RPC_INVALID_PARAMS = -32602;
 
 const bridgeError = (cause: unknown): AcpMcpBridgeError =>
   cause instanceof AcpMcpBridgeError
@@ -120,11 +125,12 @@ export const mcpToolSession = (
     const responses = yield* send({ jsonrpc: "2.0", id, method, params });
     const envelope = asEnvelope(responses.find((entry) => asEnvelope(entry)?.id === id));
     if (envelope === null || envelope.error !== undefined) {
-      return yield* Effect.fail(
-        new AcpMcpBridgeError(
-          `T3 Code MCP ${method} failed${envelope?.error === undefined ? "." : `: ${JSON.stringify(envelope.error)}`}`,
-        ),
+      const code = (envelope?.error as { readonly code?: unknown } | null | undefined)?.code;
+      const error = new AcpMcpBridgeError(
+        `T3 Code MCP ${method} failed${envelope?.error === undefined ? "." : `: ${JSON.stringify(envelope.error)}`}`,
       );
+      if (typeof code === "number") error.code = code;
+      return yield* Effect.fail(error);
     }
     return envelope;
   });

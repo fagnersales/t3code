@@ -28,7 +28,12 @@ import { Argument, Command, Flag, GlobalFlag } from "effect/cli";
 
 import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
 import * as ServerConfig from "../config.ts";
-import { mcpToolSession, type McpToolSession } from "../mcp/AcpMcpStdioBridge.ts";
+import {
+  JSON_RPC_INVALID_PARAMS,
+  mcpToolSession,
+  type McpToolSession,
+} from "../mcp/AcpMcpStdioBridge.ts";
+import { expandHomePath } from "../os-jank.ts";
 import { readPersistedServerRuntimeState } from "../serverRuntimeState.ts";
 import { projectLocationFlags, resolveCliAuthConfig } from "./config.ts";
 
@@ -38,6 +43,8 @@ import { projectLocationFlags, resolveCliAuthConfig } from "./config.ts";
  */
 const WAIT_SLICE_MS = 15_000;
 const READ_PAGE_LIMIT = 100;
+/** A `beforePosition` past every item, so the read starts at the newest. */
+const NEWEST_POSITION = Number.MAX_SAFE_INTEGER;
 const TITLE_MAX_CHARS = 80;
 
 export class ThreadServerNotRunningError extends Schema.TaggedError<ThreadServerNotRunningError>()(
@@ -171,7 +178,7 @@ const toolFailureDetail = (result: typeof ToolResult.Type) => {
   });
 };
 
-const makeThreadTools = (session: McpToolSession, origin: string) => {
+export const makeThreadTools = (session: McpToolSession, origin: string) => {
   const unexpected = (tool: string) =>
     new ThreadToolFailedError({
       tool,
@@ -185,7 +192,13 @@ const makeThreadTools = (session: McpToolSession, origin: string) => {
     ): Effect.fn.Return<S["Type"], ThreadServerUnreachableError | ThreadToolFailedError> {
       const raw = yield* session
         .call(tool, args)
-        .pipe(Effect.mapError((cause) => new ThreadServerUnreachableError({ origin, cause })));
+        .pipe(
+          Effect.mapError((cause) =>
+            cause.code === JSON_RPC_INVALID_PARAMS
+              ? new ThreadToolFailedError({ tool, detail: cause.message })
+              : new ThreadServerUnreachableError({ origin, cause }),
+          ),
+        );
       const result = yield* decodeToolResult(raw).pipe(Effect.mapError(() => unexpected(tool)));
       if (result.isError === true) {
         return yield* new ThreadToolFailedError({ tool, detail: toolFailureDetail(result) });
@@ -287,7 +300,9 @@ const resolveProject = Effect.fn("cli.thread.resolveProject")(function* (
   // through a symlink (macOS /tmp), so both sides compare as real paths.
   const realPath = (value: string) =>
     fileSystem.realPath(value).pipe(Effect.orElseSucceed(() => value));
-  const target = yield* realPath(path.resolve(yield* HostProcess.WorkingDirectory, identifier));
+  const target = yield* realPath(
+    path.resolve(yield* HostProcess.WorkingDirectory, yield* expandHomePath(identifier)),
+  );
   const roots = yield* Effect.forEach(projects, (project) =>
     Effect.map(realPath(project.workspaceRoot), (root) => ({ project, root })),
   );
@@ -333,6 +348,120 @@ const readTimeline = Effect.fn("cli.thread.readTimeline")(function* (
   return { thread: page.thread, items };
 });
 
+/**
+ * Pages back from the newest item until `done` accepts a page, newest page
+ * first. Undefined when the server predates `beforePosition`: its strict
+ * schema rejects the field, and a lenient one answers without `previousPosition`.
+ */
+const readBackward = Effect.fn("cli.thread.readBackward")(function* (
+  tools: ThreadTools,
+  threadId: ThreadId,
+  view: "messages" | "activity",
+  nextLimit: () => number,
+  done: (page: ReadonlyArray<OrchestratorMcpThreadTimelineItem>) => boolean,
+) {
+  const read = (beforePosition: number) =>
+    tools.call(
+      "t3_thread_read",
+      { threadId, view, limit: nextLimit(), runLimit: 1, beforePosition },
+      OrchestratorMcpThreadReadResult,
+    );
+  const newest = yield* read(NEWEST_POSITION).pipe(
+    Effect.catchTags({ ThreadToolFailedError: () => Effect.succeed(null) }),
+  );
+  if (newest === null || newest.previousPosition === undefined) return undefined;
+  const pages = [newest.items];
+  let previous = done(newest.items) ? null : newest.previousPosition;
+  while (previous !== null) {
+    const before = previous;
+    const page = yield* read(before);
+    // A server that repeats a page, or a cursor that does not move back, would read forever.
+    const items = page.items.filter((item) => item.position < before);
+    pages.push(items);
+    const next = page.previousPosition ?? null;
+    previous = done(items) || next === null || next >= before ? null : next;
+  }
+  return { thread: newest.thread, pages };
+});
+
+const isConversationMessage = (item: OrchestratorMcpThreadTimelineItem) =>
+  item.type === "user_message" || item.type === "assistant_message";
+
+/**
+ * `readLatestMessages` for servers without `beforePosition`. Positions count
+ * every timeline item, so the read starts near the end and widens backward
+ * only while tool and plan items leave too few messages.
+ */
+const readLatestMessagesForward = Effect.fn("cli.thread.readLatestMessagesForward")(function* (
+  tools: ThreadTools,
+  threadId: ThreadId,
+  count: number,
+) {
+  let { thread } = yield* tools.call(
+    "t3_thread_read",
+    { threadId, limit: 1, runLimit: 1 },
+    OrchestratorMcpThreadReadResult,
+  );
+  let messages: Array<OrchestratorMcpThreadTimelineItem> = [];
+  // The newest window has no upper bound, so items added since the first
+  // read are still shown.
+  let before: number | undefined;
+  let start = thread.itemCount;
+  let span = Math.max(count, READ_PAGE_LIMIT);
+  do {
+    const end = before;
+    start = Math.max(0, start - span);
+    const window: Array<OrchestratorMcpThreadTimelineItem> = [];
+    let afterPosition = start - 1;
+    let page: OrchestratorMcpThreadReadResult;
+    do {
+      page = yield* tools.call(
+        "t3_thread_read",
+        {
+          threadId,
+          view: "messages",
+          limit: READ_PAGE_LIMIT,
+          runLimit: 1,
+          ...(afterPosition < 0 ? {} : { afterPosition }),
+        },
+        OrchestratorMcpThreadReadResult,
+      );
+      window.push(
+        ...page.items.filter(
+          (item) => isConversationMessage(item) && (end === undefined || item.position < end),
+        ),
+      );
+      afterPosition = page.nextPosition ?? Number.POSITIVE_INFINITY;
+    } while (page.hasMore && afterPosition < (end ?? Number.POSITIVE_INFINITY) - 1);
+    thread = page.thread;
+    // A window can hold the whole --messages count, too many to spread as arguments.
+    messages = window.concat(messages);
+    before = start;
+    span *= 2;
+  } while (messages.length < count && start > 0);
+  return { thread, messages: messages.slice(Math.max(0, messages.length - count)) };
+});
+
+/** The latest `count` user and assistant messages, oldest first. */
+export const readLatestMessages = Effect.fn("cli.thread.readLatestMessages")(function* (
+  tools: ThreadTools,
+  threadId: ThreadId,
+  count: number,
+) {
+  let found = 0;
+  const read = yield* readBackward(
+    tools,
+    threadId,
+    "messages",
+    // Items can be long, so a page asks only for the messages still missing.
+    () => Math.min(READ_PAGE_LIMIT, Math.max(1, count - found)),
+    (page) => (found += page.filter(isConversationMessage).length) >= count,
+  );
+  if (read === undefined) return yield* readLatestMessagesForward(tools, threadId, count);
+  const messages = read.pages.toReversed().flat().filter(isConversationMessage);
+  return { thread: read.thread, messages: messages.slice(Math.max(0, messages.length - count)) };
+});
+
 /** Item text past the read's per-item cap. */
 const readFullText = Effect.fn("cli.thread.readFullText")(function* (
   tools: ThreadTools,
@@ -362,12 +491,18 @@ const runResultText = Effect.fn("cli.thread.runResultText")(function* (
   runId: RunId,
   type: "assistant_message" | "error",
 ) {
-  const { items } = yield* readTimeline(
+  const view = type === "assistant_message" ? "messages" : "activity";
+  const matches = (candidate: OrchestratorMcpThreadTimelineItem) =>
+    candidate.runId === runId && candidate.type === type;
+  const read = yield* readBackward(
     tools,
     threadId,
-    type === "assistant_message" ? "messages" : "activity",
+    view,
+    () => READ_PAGE_LIMIT,
+    (page) => page.some(matches),
   );
-  const item = items.findLast((candidate) => candidate.runId === runId && candidate.type === type);
+  const pages = read?.pages ?? [(yield* readTimeline(tools, threadId, view)).items];
+  const item = pages.map((page) => page.findLast(matches)).find((match) => match !== undefined);
   return item === undefined ? null : yield* readFullText(tools, threadId, item);
 });
 
@@ -451,11 +586,16 @@ const finishRun = Effect.fn("cli.thread.finishRun")(function* (
   }
 });
 
-const titleFromMessage = (message: string) => {
+export const titleFromMessage = (message: string) => {
   const firstLine = message.trim().split("\n")[0]?.trim() ?? "";
-  return firstLine.length > TITLE_MAX_CHARS
-    ? `${firstLine.slice(0, TITLE_MAX_CHARS - 1).trimEnd()}…`
-    : firstLine;
+  if (firstLine.length <= TITLE_MAX_CHARS) return firstLine;
+  let end = TITLE_MAX_CHARS - 1;
+  const previous = firstLine.charCodeAt(end - 1);
+  const next = firstLine.charCodeAt(end);
+  if (previous >= 0xd800 && previous <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) {
+    end -= 1;
+  }
+  return `${firstLine.slice(0, end).trimEnd()}…`;
 };
 
 const launchWorkspaceStrategy = (input: {
@@ -662,11 +802,11 @@ const threadShowCommand = Command.make("show", {
       yield* withThreadTools(
         flags,
         Effect.fn("cli.thread.show")(function* (tools) {
-          const { thread, items } = yield* readTimeline(tools, threadId, "messages");
-          const conversation = items.filter(
-            (item) => item.type === "user_message" || item.type === "assistant_message",
+          const { thread, messages: latest } = yield* readLatestMessages(
+            tools,
+            threadId,
+            flags.messages,
           );
-          const latest = conversation.slice(Math.max(0, conversation.length - flags.messages));
           const messages = yield* Effect.forEach(latest, (item) =>
             readFullText(tools, threadId, item).pipe(
               Effect.map((text) => ({

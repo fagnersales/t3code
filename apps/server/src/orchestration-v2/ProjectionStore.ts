@@ -370,6 +370,8 @@ export type ProjectionRecords<K extends ProjectionRecordField> = Pick<
 
 export interface ProjectionTimelinePageOptions {
   readonly afterPosition?: number;
+  /** Selects the last `limit` matches before this position instead of the first. */
+  readonly beforePosition?: number;
   readonly itemId?: TurnItemId;
   readonly view?: "messages" | "activity";
   readonly limit: number;
@@ -377,7 +379,9 @@ export interface ProjectionTimelinePageOptions {
 export interface ProjectionTimelinePage {
   readonly items: ReadonlyArray<OrchestrationV2ProjectedTurnItem>;
   readonly totalItems: number;
+  /** Matches in the view after and before the page, beyond any position bounds. */
   readonly hasMore: boolean;
+  readonly hasEarlier: boolean;
 }
 
 export interface ShellSnapshotOptions {
@@ -5578,18 +5582,26 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         .withTransaction(
           Effect.gen(function* () {
             const index = yield* readTimelineIndex(threadId, new Set());
-            const matching = index.visible
+            const inView = index.visible
               .map((row, position) => ({ ...row, position }))
               .filter((row) =>
                 options.itemId === undefined
-                  ? row.position > (options.afterPosition ?? -1) &&
-                    (options.view === "activity" ||
-                      ["user_message", "assistant_message", "proposed_plan"].includes(
-                        row.item.type,
-                      ))
+                  ? options.view === "activity" ||
+                    ["user_message", "assistant_message", "proposed_plan"].includes(row.item.type)
                   : row.sourceItemId === options.itemId,
               );
-            const page = matching.slice(0, options.limit);
+            const matching =
+              options.itemId === undefined
+                ? inView.filter(
+                    (row) =>
+                      row.position > (options.afterPosition ?? -1) &&
+                      row.position < (options.beforePosition ?? Number.POSITIVE_INFINITY),
+                  )
+                : inView;
+            const page =
+              options.beforePosition === undefined
+                ? matching.slice(0, options.limit)
+                : matching.slice(-options.limit);
             const items = yield* Effect.forEach(page, (row) =>
               Effect.gen(function* () {
                 if (row.synthetic !== undefined)
@@ -5625,7 +5637,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             return {
               items,
               totalItems: index.visible.length,
-              hasMore: matching.length > page.length,
+              hasMore: (page.at(-1)?.position ?? Infinity) < (inView.at(-1)?.position ?? -1),
+              hasEarlier: (page[0]?.position ?? -1) > (inView[0]?.position ?? Infinity),
             };
           }),
         )
