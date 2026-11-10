@@ -8,6 +8,7 @@ import {
   type ThreadRestoreResult,
 } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -19,6 +20,8 @@ import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
+import type { Connection } from "effect/sql/SqlConnection";
+import type { SqlError } from "effect/sql/SqlError";
 import * as Stream from "effect/Stream";
 
 import * as ServerConfig from "../config.ts";
@@ -54,16 +57,34 @@ const isThreadOffloadError = Schema.is(ThreadOffloadError);
 const fail = (reason: ThreadOffloadError["reason"], detail: string, cause?: unknown) =>
   new ThreadOffloadError({ reason, detail, ...(cause === undefined ? {} : { cause }) });
 
+interface ThreadTable {
+  readonly table: string;
+  /** The column naming the thread, or the row when `namedBy` is set. */
+  readonly column: string;
+  /** A condition the thread's rows also meet. */
+  readonly filter?: string;
+  /**
+   * Set when the row belongs to the thread whose events of these types name it by `$.id`, rather
+   * than to the thread its own columns name.
+   */
+  readonly namedBy?: ReadonlyArray<string>;
+}
+
+/** Selects one thread's rows of the table with a single `?`. */
+const whereOf = (spec: ThreadTable) =>
+  spec.namedBy !== undefined
+    ? `${spec.column} IN (
+      SELECT json_extract(payload_json, '$.id') FROM orchestration_events
+      WHERE aggregate_kind = 'thread' AND stream_id = ?
+        AND event_type IN (${spec.namedBy.map((type) => `'${type}'`).join(", ")}))`
+    : `${spec.filter === undefined ? "" : `${spec.filter} AND `}${spec.column} = ?`;
+
 /**
  * Every table that holds a thread's rows, in the order a restore inserts them: the thread row
- * comes first because the message search trigger reads it. `where` selects one thread's rows
- * with a single `?`. Each must exist with its column, or nothing is offloaded.
+ * comes first because the message search trigger reads it. Each must exist with its column, or
+ * nothing is offloaded.
  */
-const THREAD_TABLES: ReadonlyArray<{
-  readonly table: string;
-  readonly where: string;
-  readonly column: string;
-}> = [
+const THREAD_TABLES: ReadonlyArray<ThreadTable> = [
   ...[
     "orchestration_v2_projection_threads",
     "orchestration_v2_projection_runs",
@@ -80,35 +101,25 @@ const THREAD_TABLES: ReadonlyArray<{
     "orchestration_v2_projection_checkpoint_scopes",
     "orchestration_v2_projection_checkpoints",
     "orchestration_v2_projection_context_handoffs",
-  ].map((table) => ({ table, where: "thread_id = ?", column: "thread_id" })),
+  ].map((table) => ({ table, column: "thread_id" })),
   // A transfer names two threads and a provider thread names its app thread, which another
   // thread's events may write; each row goes with the thread whose events project it.
   {
     table: "orchestration_v2_projection_provider_threads",
-    where: `provider_thread_id IN (
-      SELECT json_extract(payload_json, '$.id') FROM orchestration_events
-      WHERE aggregate_kind = 'thread' AND stream_id = ?
-        AND event_type = 'provider-thread.updated')`,
     column: "provider_thread_id",
+    namedBy: ["provider-thread.updated"],
   },
   {
     table: "orchestration_v2_projection_context_transfers",
-    where: `context_transfer_id IN (
-      SELECT json_extract(payload_json, '$.id') FROM orchestration_events
-      WHERE aggregate_kind = 'thread' AND stream_id = ?
-        AND event_type IN ('context-transfer.created', 'context-transfer.updated'))`,
     column: "context_transfer_id",
+    namedBy: ["context-transfer.created", "context-transfer.updated"],
   },
-  { table: "orchestration_v2_turn_item_positions", where: "thread_id = ?", column: "thread_id" },
-  {
-    table: "orchestration_events",
-    where: "aggregate_kind = 'thread' AND stream_id = ?",
-    column: "stream_id",
-  },
+  { table: "orchestration_v2_turn_item_positions", column: "thread_id" },
+  { table: "orchestration_events", column: "stream_id", filter: "aggregate_kind = 'thread'" },
   {
     table: "orchestration_command_receipts",
-    where: "aggregate_kind = 'thread' AND aggregate_id = ?",
     column: "aggregate_id",
+    filter: "aggregate_kind = 'thread'",
   },
   // The legacy importer recreates a thread whose v1 rows outlive its v2 events.
   ...[
@@ -123,7 +134,7 @@ const THREAD_TABLES: ReadonlyArray<{
     "projection_thread_messages",
     "projection_thread_sessions",
     "projection_thread_pull_requests",
-  ].map((table) => ({ table, where: "thread_id = ?", column: "thread_id" })),
+  ].map((table) => ({ table, column: "thread_id" })),
 ];
 
 /**
@@ -139,6 +150,7 @@ const THREAD_COLUMN_FILTER = `p.name IN ('thread_id', 'stream_id', 'aggregate_id
   OR p.name GLOB '*_thread_id'`;
 
 interface TableShape {
+  readonly spec: ThreadTable;
   readonly table: string;
   readonly where: string;
   readonly columns: ReadonlyArray<string>;
@@ -156,6 +168,93 @@ interface Fingerprint {
 const quote = (identifier: string) => `"${identifier.replaceAll('"', '""')}"`;
 
 const TERMINAL_RUN_STATUSES = "('completed','failed','cancelled','interrupted','rolled_back')";
+
+/**
+ * Threads still running or open, as the server recovers them at startup. Each query names its
+ * thread column, so a check of a few threads reads only theirs.
+ */
+const BUSY_QUERIES: ReadonlyArray<{ readonly column: string; readonly query: string }> = [
+  {
+    column: "thread_id",
+    query: `SELECT thread_id, 'running' AS reason FROM orchestration_v2_projection_runs
+      WHERE status NOT IN ${TERMINAL_RUN_STATUSES}`,
+  },
+  {
+    column: "thread_id",
+    query: `SELECT thread_id, 'waiting for an answer' FROM orchestration_v2_projection_runtime_requests
+      WHERE status = 'pending'`,
+  },
+  {
+    column: "thread_id",
+    query: `SELECT thread_id, 'subagent running' FROM orchestration_v2_projection_subagents
+      WHERE status IN ('pending', 'running', 'waiting')`,
+  },
+  {
+    column: "item.thread_id",
+    query: `SELECT item.thread_id, 'tool running' FROM orchestration_v2_projection_turn_items AS item
+      WHERE type IN ('command_execution', 'dynamic_tool', 'subagent')
+        AND status IN ('pending', 'running', 'waiting')
+        AND NOT EXISTS (
+          SELECT 1 FROM orchestration_v2_projection_runs AS run
+          WHERE run.run_id = item.run_id AND run.status = 'rolled_back')`,
+  },
+  {
+    column: "thread_id",
+    query: `SELECT thread_id, 'provider session open' FROM orchestration_v2_projection_provider_sessions
+      WHERE thread_id IS NOT NULL AND status NOT IN ('stopped', 'error')`,
+  },
+  {
+    column: "bindings.thread_id",
+    query: `SELECT bindings.thread_id, 'provider session open'
+      FROM orchestration_v2_projection_provider_session_bindings AS bindings
+      JOIN orchestration_v2_projection_provider_sessions AS sessions
+        ON sessions.provider_session_id = bindings.provider_session_id
+      WHERE sessions.status NOT IN ('stopped', 'error')`,
+  },
+  {
+    column: "thread_id",
+    query: `SELECT thread_id, 'provider thread active' FROM orchestration_v2_projection_provider_threads
+      WHERE status = 'active'`,
+  },
+  {
+    column: "thread_id",
+    query: `SELECT thread_id, 'effects pending' FROM orchestration_v2_effect_outbox
+      WHERE status IN ('pending', 'running')`,
+  },
+  {
+    column: "thread_id",
+    query: `SELECT thread_id, 'scheduled task' FROM scheduled_tasks WHERE thread_id IS NOT NULL`,
+  },
+  {
+    column: "source_thread_id",
+    query: `SELECT source_thread_id, 'context transfer pending'
+      FROM orchestration_v2_projection_context_transfers WHERE status = 'pending'`,
+  },
+  {
+    column: "target_thread_id",
+    query: `SELECT target_thread_id, 'context transfer pending'
+      FROM orchestration_v2_projection_context_transfers WHERE status = 'pending'`,
+  },
+  {
+    column: "thread_id",
+    query: `SELECT thread_id, 'imported session' FROM orchestration_v2_projection_threads
+      WHERE thread_id LIKE 'import:%'`,
+  },
+  {
+    column: "thread_id",
+    query: `SELECT thread_id, 'imported session' FROM provider_session_runtime
+      WHERE json_valid(runtime_payload_json)
+        AND json_type(runtime_payload_json, '$.importedTranscripts') IS NOT NULL`,
+  },
+];
+
+/** Every busy thread, or with `scoped` only those in the JSON array bound to `?1`. */
+const busyQuery = (scoped: boolean) =>
+  BUSY_QUERIES.map(({ column, query }) =>
+    scoped ? `${query} AND ${column} IN (SELECT value FROM json_each(?1))` : query,
+  ).join("\n      UNION ");
+
+const encodeIds = Schema.encodeSync(Schema.fromJsonString(Schema.Array(Schema.String)));
 
 interface ThreadRow {
   readonly thread_id: string;
@@ -302,16 +401,58 @@ const toLineValue = (value: unknown) =>
 const fromLineValue = (value: unknown) =>
   isBlobValue(value) ? new Uint8Array(Buffer.from(value.$blob, "base64")) : value;
 
-const ROW_BATCH_BYTES = 16 * 1024 * 1024;
+/** Each read of rows to export, and each delete, stays this small so no step blocks for long. */
+const ROW_BATCH_BYTES = 4 * 1024 * 1024;
 const ROW_BATCH_COUNT = 400;
+const DELETE_BATCH_BYTES = 16 * 1024 * 1024;
 const ID_CHUNK = 400;
+/** Rowids per read when a whole table is summed. */
+const SLICE_ROWS = 2000;
 
-const chunk = <A>(items: ReadonlyArray<A>, size: number) => {
-  const chunks: Array<ReadonlyArray<A>> = [];
-  for (let index = 0; index < items.length; index += size) {
-    chunks.push(items.slice(index, index + size));
+/** Lets timers, sockets and other fibers run between steps of a long job. */
+const yieldToEventLoop = Effect.callback<void>((resume) => {
+  const immediate = setImmediate(() => resume(Effect.void));
+  return Effect.sync(() => clearImmediate(immediate));
+});
+
+/** Bundle text handled between two yields to the event loop. */
+const YIELD_EVERY_BYTES = 4 * 1024 * 1024;
+
+/**
+ * Bundle lines mostly come from buffered chunks, so reading them never returns to the event loop
+ * by itself; a loop over lines calls this with each line's size.
+ */
+const makePacer = () => {
+  let since = 0;
+  return (bytes: number) =>
+    Effect.suspend(() => {
+      since += bytes;
+      if (since < YIELD_EVERY_BYTES) return Effect.void;
+      since = 0;
+      return yieldToEventLoop;
+    });
+};
+
+interface ExportedRow {
+  readonly rowid: number;
+  readonly bytes: number;
+}
+
+/** Consecutive rows, at most `count` and, past the first, `bytes` per batch. */
+const batchRows = (rows: ReadonlyArray<ExportedRow>, count: number, bytes: number) => {
+  const batches: Array<Array<ExportedRow>> = [];
+  let batchBytes = 0;
+  for (const row of rows) {
+    const last = batches.at(-1);
+    if (last === undefined || last.length >= count || batchBytes + row.bytes > bytes) {
+      batches.push([row]);
+      batchBytes = row.bytes;
+    } else {
+      last.push(row);
+      batchBytes += row.bytes;
+    }
   }
-  return chunks;
+  return batches;
 };
 
 export interface ThreadOffloadShape {
@@ -349,6 +490,12 @@ export class ThreadOffload extends Context.Service<ThreadOffload, ThreadOffloadS
 export class BeforeDelete extends Context.Reference<
   (threadIds: ReadonlyArray<ThreadId>) => Effect.Effect<void>
 >("t3/threadOffload/BeforeDelete", { defaultValue: () => () => Effect.void }) {}
+
+/** The reader an offload operation reads through, when it has one of its own. */
+const DedicatedReader = Context.Reference<Connection | undefined>(
+  "t3/threadOffload/DedicatedReader",
+  { defaultValue: () => undefined },
+);
 
 /** Where the offloaded threads of a T3 home live; the CLI reads records from here directly. */
 export const offloadDirectoryFor = (baseDir: string, path: Path.Path) =>
@@ -396,8 +543,33 @@ const make = Effect.gen(function* () {
       Effect.provideService(Path.Path, path),
     );
 
-  const read = <A extends object>(text: string, params: ReadonlyArray<unknown> = []) =>
-    sql.unsafe<A>(text, params).pipe(NodeSqliteClient.readOnly);
+  /**
+   * Reads go through the operation's own reader worker: planning and exporting read gigabytes in
+   * thousands of statements, and on the shared reader every request (sign-in included) would
+   * queue behind them. Without a worker of its own, an operation reads on the shared one.
+   */
+  const read = Effect.fnUntraced(function* <A extends object>(
+    text: string,
+    params: ReadonlyArray<unknown> = [],
+  ) {
+    const connection = yield* DedicatedReader;
+    if (connection === undefined) {
+      return yield* sql.unsafe<A>(text, params).pipe(NodeSqliteClient.readOnly);
+    }
+    return (yield* connection.execute(text, params, undefined)) as ReadonlyArray<A>;
+  });
+
+  const databaseFile =
+    (yield* sql<{ readonly file: string }>`
+    SELECT file FROM pragma_database_list WHERE name = 'main'
+  `)[0]?.file ?? "";
+
+  const withDedicatedReader = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+    Effect.scoped(
+      Effect.flatMap(NodeSqliteClient.makeDedicatedReader(databaseFile), (connection) =>
+        Effect.provideService(effect, DedicatedReader, connection),
+      ),
+    );
 
   const promise = <A>(operation: string, run: () => Promise<A>) =>
     Effect.tryPromise({
@@ -443,8 +615,9 @@ const make = Effect.gen(function* () {
       }
       const keys = info.filter((column) => column.pk > 0);
       shapes.push({
+        spec,
         table: spec.table,
-        where: spec.where,
+        where: whereOf(spec),
         columns: info.map((column) => column.name),
         rowidAlias: keys.length === 1 && keys[0]!.type.toUpperCase() === "INTEGER",
         sizeExpression: info
@@ -516,10 +689,17 @@ const make = Effect.gen(function* () {
     yield* PubSub.publish(resyncs, undefined);
   });
 
+  /**
+   * The threads to weigh. With `rootThreadId`, only its unit's threads are checked for activity
+   * and work in progress; the others are marked unchecked, so they never qualify.
+   */
   const loadCandidates = Effect.fn("ThreadOffload.loadCandidates")(function* (
     keepThreadIds: ReadonlySet<string>,
+    rootThreadId?: ThreadId,
   ) {
     const now = DateTime.formatIso(yield* DateTime.now);
+    // One statement, so a thread row rewritten meanwhile is not missed: a child left out of its
+    // parent's unit would outlive what it reads.
     const threadRows = yield* read<ThreadRow>(`
       SELECT thread_id, title,
         json_extract(payload_json, '$.lineage.parentThreadId') AS parent_thread_id,
@@ -529,77 +709,11 @@ const make = Effect.gen(function* () {
         json_extract(payload_json, '$.snoozedUntil') AS snoozed_until
       FROM orchestration_v2_projection_threads
     `);
-    const lastEvents = yield* read<{
-      readonly stream_id: string;
-      readonly occurred_at: string;
-      readonly sequence: number;
-    }>(`
-      SELECT event.stream_id, event.occurred_at, event.sequence
-      FROM (
-        SELECT stream_id, MAX(sequence) AS sequence
-        FROM orchestration_events INDEXED BY idx_orchestration_events_agent_stream_sequence
-        WHERE application_event_version = 2 AND aggregate_kind = 'thread'
-        GROUP BY stream_id
-      ) AS latest
-      JOIN orchestration_events AS event ON event.sequence = latest.sequence
-    `);
-    // Mirrors the threads the server recovers at startup: anything still running or open.
-    const busyRows = yield* read<{ readonly thread_id: string; readonly reason: string }>(`
-      SELECT thread_id, 'running' AS reason FROM orchestration_v2_projection_runs
-        WHERE status NOT IN ${TERMINAL_RUN_STATUSES}
-      UNION SELECT thread_id, 'waiting for an answer' FROM orchestration_v2_projection_runtime_requests
-        WHERE status = 'pending'
-      UNION SELECT thread_id, 'subagent running' FROM orchestration_v2_projection_subagents
-        WHERE status IN ('pending', 'running', 'waiting')
-      UNION SELECT item.thread_id, 'tool running' FROM orchestration_v2_projection_turn_items AS item
-        WHERE type IN ('command_execution', 'dynamic_tool', 'subagent')
-          AND status IN ('pending', 'running', 'waiting')
-          AND NOT EXISTS (
-            SELECT 1 FROM orchestration_v2_projection_runs AS run
-            WHERE run.run_id = item.run_id AND run.status = 'rolled_back')
-      UNION SELECT thread_id, 'provider session open' FROM orchestration_v2_projection_provider_sessions
-        WHERE thread_id IS NOT NULL AND status NOT IN ('stopped', 'error')
-      UNION SELECT bindings.thread_id, 'provider session open'
-        FROM orchestration_v2_projection_provider_session_bindings AS bindings
-        JOIN orchestration_v2_projection_provider_sessions AS sessions
-          ON sessions.provider_session_id = bindings.provider_session_id
-        WHERE sessions.status NOT IN ('stopped', 'error')
-      UNION SELECT thread_id, 'provider thread active' FROM orchestration_v2_projection_provider_threads
-        WHERE status = 'active'
-      UNION SELECT thread_id, 'effects pending' FROM orchestration_v2_effect_outbox
-        WHERE status IN ('pending', 'running')
-      UNION SELECT thread_id, 'scheduled task' FROM scheduled_tasks WHERE thread_id IS NOT NULL
-      UNION SELECT source_thread_id, 'context transfer pending'
-        FROM orchestration_v2_projection_context_transfers WHERE status = 'pending'
-      UNION SELECT target_thread_id, 'context transfer pending'
-        FROM orchestration_v2_projection_context_transfers WHERE status = 'pending'
-      UNION SELECT thread_id, 'imported session' FROM orchestration_v2_projection_threads
-        WHERE thread_id LIKE 'import:%'
-      UNION SELECT thread_id, 'imported session' FROM provider_session_runtime
-        WHERE json_valid(runtime_payload_json)
-          AND json_type(runtime_payload_json, '$.importedTranscripts') IS NOT NULL
-    `);
-    const latestSequence = Math.max(0, ...lastEvents.map((event) => event.sequence));
-    const lastByThread = new Map(lastEvents.map((event) => [event.stream_id, event]));
-    const reasonsByThread = new Map<string, Array<string>>();
-    const addReason = (threadId: string, reason: string) => {
-      const reasons = reasonsByThread.get(threadId) ?? [];
-      if (!reasons.includes(reason)) reasons.push(reason);
-      reasonsByThread.set(threadId, reasons);
-    };
-    for (const row of busyRows) addReason(row.thread_id, row.reason);
-    const threads = new Map<string, ThreadState>();
     const dependents = new Map<string, Array<ThreadId>>();
     const forkSources = new Map<string, ThreadId>();
     const ids = new Set(threadRows.map((row) => row.thread_id));
     for (const row of threadRows) {
       const id = ThreadId.make(row.thread_id);
-      if (row.pinned_at !== null) addReason(id, "pinned");
-      if (row.snoozed_until !== null && row.snoozed_until > now) addReason(id, "snoozed");
-      if (keepThreadIds.has(id)) addReason(id, "in a thread group");
-      const last = lastByThread.get(id);
-      // The projection records how far it has applied events; that event must stay.
-      if (last !== undefined && last.sequence === latestSequence) addReason(id, "latest event");
       const owners = [
         row.parent_thread_id,
         row.fork_type === "run" ? row.fork_thread_id : null,
@@ -610,6 +724,59 @@ const make = Effect.gen(function* () {
       if (row.fork_type === "run" && row.fork_thread_id !== null && ids.has(row.fork_thread_id)) {
         forkSources.set(id, ThreadId.make(row.fork_thread_id));
       }
+    }
+    const checked =
+      rootThreadId === undefined || !ids.has(rootThreadId)
+        ? undefined
+        : new Set<string>(unitOf({ threads: new Map(), dependents, forkSources }, rootThreadId));
+    const checkedIds = checked === undefined ? [] : [encodeIds([...checked])];
+    const lastEvents = yield* read<{
+      readonly stream_id: string;
+      readonly occurred_at: string;
+      readonly sequence: number;
+    }>(
+      `
+      SELECT event.stream_id, event.occurred_at, event.sequence
+      FROM (
+        SELECT stream_id, MAX(sequence) AS sequence
+        FROM orchestration_events INDEXED BY idx_orchestration_events_agent_stream_sequence
+        WHERE application_event_version = 2 AND aggregate_kind = 'thread'
+          ${checked === undefined ? "" : "AND stream_id IN (SELECT value FROM json_each(?1))"}
+        GROUP BY stream_id
+      ) AS latest
+      JOIN orchestration_events AS event ON event.sequence = latest.sequence
+    `,
+      checkedIds,
+    );
+    const latestSequence =
+      checked === undefined
+        ? Math.max(0, ...lastEvents.map((event) => event.sequence))
+        : ((yield* read<{ readonly sequence: number | null }>(`
+            SELECT MAX(sequence) AS sequence FROM orchestration_events
+            WHERE application_event_version = 2 AND aggregate_kind = 'thread'
+          `))[0]?.sequence ?? 0);
+    const busyRows = yield* read<{ readonly thread_id: string; readonly reason: string }>(
+      busyQuery(checked !== undefined),
+      checkedIds,
+    );
+    const lastByThread = new Map(lastEvents.map((event) => [event.stream_id, event]));
+    const reasonsByThread = new Map<string, Array<string>>();
+    const addReason = (threadId: string, reason: string) => {
+      const reasons = reasonsByThread.get(threadId) ?? [];
+      if (!reasons.includes(reason)) reasons.push(reason);
+      reasonsByThread.set(threadId, reasons);
+    };
+    for (const row of busyRows) addReason(row.thread_id, row.reason);
+    const threads = new Map<string, ThreadState>();
+    for (const row of threadRows) {
+      const id = ThreadId.make(row.thread_id);
+      if (checked !== undefined && !checked.has(id)) addReason(id, "not checked");
+      if (row.pinned_at !== null) addReason(id, "pinned");
+      if (row.snoozed_until !== null && row.snoozed_until > now) addReason(id, "snoozed");
+      if (keepThreadIds.has(id)) addReason(id, "in a thread group");
+      const last = lastByThread.get(id);
+      // The projection records how far it has applied events; that event must stay.
+      if (last !== undefined && last.sequence === latestSequence) addReason(id, "latest event");
       threads.set(id, {
         id,
         title: row.title,
@@ -622,17 +789,108 @@ const make = Effect.gen(function* () {
     return { threads, dependents, forkSources } satisfies Candidates;
   });
 
-  const threadBytes = Effect.fn("ThreadOffload.threadBytes")(function* (
-    shapes: ReadonlyArray<TableShape>,
-    threadId: ThreadId,
+  /**
+   * Calls `run` for each window of `SLICE_ROWS` rowids of the table, so no read runs long. Its
+   * reads say `NOT INDEXED`: an index on a filtered column would scan the table for every window.
+   */
+  const forEachSlice = Effect.fn("ThreadOffload.forEachSlice")(function* (
+    table: string,
+    run: (from: number, to: number) => Effect.Effect<void, ThreadOffloadError | SqlError>,
   ) {
-    let bytes = 0;
-    for (const shape of shapes) {
-      const rows = yield* read<{ readonly bytes: number | null }>(
-        `SELECT SUM(${shape.sizeExpression}) AS bytes FROM ${quote(shape.table)} WHERE ${shape.where}`,
-        [threadId],
+    const bounds = yield* read<{ readonly low: number | null; readonly high: number | null }>(
+      `SELECT MIN(rowid) AS low, MAX(rowid) AS high FROM ${quote(table)}`,
+    );
+    const low = bounds[0]?.low ?? null;
+    const high = bounds[0]?.high ?? null;
+    if (low === null || high === null) return;
+    for (let from = low; from <= high; from += SLICE_ROWS) {
+      yield* run(from, from + SLICE_ROWS);
+    }
+  });
+
+  /**
+   * The bytes of each of `threadIds` in every table, as `SUM` over its rows would count them: one
+   * pass over each table in short slices, not a query per thread and table.
+   */
+  const threadSizes = Effect.fn("ThreadOffload.threadSizes")(function* (
+    shapes: ReadonlyArray<TableShape>,
+    threadIds: ReadonlySet<string>,
+  ) {
+    const bytes = new Map<string, number>();
+    const add = (threadId: string, size: number | null) => {
+      if (threadIds.has(threadId)) bytes.set(threadId, (bytes.get(threadId) ?? 0) + (size ?? 0));
+    };
+    const named = shapes.filter((shape) => shape.spec.namedBy !== undefined);
+    /** Per table, the row ids each thread's events name. */
+    const namedIds = new Map(named.map((shape) => [shape.table, new Map<string, Set<string>>()]));
+    const namingTypes = [...new Set(named.flatMap((shape) => shape.spec.namedBy ?? []))];
+    /** Notes the ids events of the slice name, while its pages are still in the cache. */
+    const collectNamedIds = (from: number, to: number) =>
+      read<{ readonly thread: string; readonly type: string; readonly id: string | null }>(
+        `SELECT stream_id AS thread, event_type AS type, json_extract(payload_json, '$.id') AS id
+         FROM orchestration_events NOT INDEXED
+         WHERE rowid >= ? AND rowid < ? AND aggregate_kind = 'thread'
+           AND event_type IN (${namingTypes.map((type) => `'${type}'`).join(", ")})`,
+        [from, to],
+      ).pipe(
+        Effect.map((rows) => {
+          for (const row of rows) {
+            if (row.id === null || !threadIds.has(row.thread)) continue;
+            for (const shape of named) {
+              if (!(shape.spec.namedBy ?? []).includes(row.type)) continue;
+              const byThread = namedIds.get(shape.table)!;
+              const set = byThread.get(row.thread) ?? new Set<string>();
+              set.add(row.id);
+              byThread.set(row.thread, set);
+            }
+          }
+        }),
       );
-      bytes += rows[0]?.bytes ?? 0;
+    // Tables whose rows events name come last, once the events pass has collected those names.
+    for (const shape of [...shapes.filter((shape) => shape.spec.namedBy === undefined), ...named]) {
+      const filter = shape.spec.filter === undefined ? "" : `AND ${shape.spec.filter}`;
+      const column = quote(shape.spec.column);
+      if (shape.spec.namedBy === undefined) {
+        yield* forEachSlice(shape.table, (from, to) =>
+          read<{ readonly thread: string; readonly bytes: number | null }>(
+            `SELECT ${column} AS thread, SUM(${shape.sizeExpression}) AS bytes
+             FROM ${quote(shape.table)} NOT INDEXED WHERE rowid >= ? AND rowid < ? ${filter}
+             GROUP BY ${column}`,
+            [from, to],
+          ).pipe(
+            Effect.map((rows) => {
+              for (const row of rows) add(row.thread, row.bytes);
+            }),
+            Effect.andThen(
+              shape.table === EVENTS_TABLE && namingTypes.length > 0
+                ? collectNamedIds(from, to)
+                : Effect.void,
+            ),
+          ),
+        );
+        continue;
+      }
+      const byThread = namedIds.get(shape.table)!;
+      const wanted = new Set([...byThread.values()].flatMap((set) => [...set]));
+      if (wanted.size === 0) continue;
+      const rowBytes = new Map<string, number>();
+      yield* forEachSlice(shape.table, (from, to) =>
+        read<{ readonly id: string; readonly bytes: number | null }>(
+          `SELECT ${column} AS id, ${shape.sizeExpression} AS bytes
+           FROM ${quote(shape.table)} NOT INDEXED WHERE rowid >= ? AND rowid < ? ${filter}`,
+          [from, to],
+        ).pipe(
+          Effect.map((rows) => {
+            for (const row of rows) {
+              if (wanted.has(row.id))
+                rowBytes.set(row.id, (rowBytes.get(row.id) ?? 0) + (row.bytes ?? 0));
+            }
+          }),
+        ),
+      );
+      for (const [threadId, set] of byThread) {
+        for (const id of set) add(threadId, rowBytes.get(id) ?? 0);
+      }
     }
     return bytes;
   });
@@ -640,18 +898,21 @@ const make = Effect.gen(function* () {
   const plan: ThreadOffloadShape["plan"] = Effect.fn("ThreadOffload.plan")(
     function* (input) {
       const candidates = yield* loadCandidates(input.keepThreadIds);
-      const selected = selectUnits(candidates, input.before, input.threadIds);
-      const limit = input.limit ?? selected.length;
-      const shapes = input.withSizes ? yield* describeTables : [];
-      const units: Array<ThreadOffloadUnit> = [];
-      for (const unit of selected.slice(0, limit)) {
-        let bytes: number | null = null;
-        if (input.withSizes) {
-          bytes = 0;
-          for (const threadId of unit.threadIds) bytes += yield* threadBytes(shapes, threadId);
-        }
-        units.push({ ...unit, bytes });
-      }
+      const all = selectUnits(candidates, input.before, input.threadIds);
+      const selected = all.slice(0, input.limit);
+      const sizes = input.withSizes
+        ? yield* threadSizes(
+            yield* describeTables,
+            new Set(selected.flatMap((unit) => unit.threadIds)),
+          )
+        : undefined;
+      const units: Array<ThreadOffloadUnit> = selected.map((unit) => ({
+        ...unit,
+        bytes:
+          sizes === undefined
+            ? null
+            : unit.threadIds.reduce((sum, threadId) => sum + (sizes.get(threadId) ?? 0), 0),
+      }));
       const kept = new Map<string, number>();
       for (const thread of candidates.threads.values()) {
         const reasons =
@@ -664,11 +925,12 @@ const make = Effect.gen(function* () {
       }
       return {
         units,
-        moreUnitCount: Math.max(0, selected.length - limit),
+        moreUnitCount: all.length - units.length,
         kept: [...kept].map(([reason, threadCount]) => ({ reason, threadCount })),
         storage: yield* storage,
       } satisfies ThreadOffloadPlan;
     },
+    withDedicatedReader,
     Effect.mapError((cause) =>
       isThreadOffloadError(cause) ? cause : fail("failed", "Could not plan.", cause),
     ),
@@ -688,8 +950,8 @@ const make = Effect.gen(function* () {
     const writer = yield* promise("Could not create the bundle", () =>
       openBundleWriter(input.bundlePath),
     );
-    /** Exported rowids per thread and table, which the delete must match exactly. */
-    const exported = new Map<string, Map<string, Array<number>>>();
+    /** Exported rows per thread and table, which the delete must match exactly. */
+    const exported = new Map<string, Map<string, ReadonlyArray<ExportedRow>>>();
     /** Each thread as its rows started being exported, which the delete must still find. */
     const fingerprints = new Map<string, Fingerprint>();
     let rowCount = 0;
@@ -699,7 +961,7 @@ const make = Effect.gen(function* () {
         writer.writeLine(encodeLine([BUNDLE_HEADER, input.header])),
       );
       for (const threadId of input.header.threadIds) {
-        const byTable = new Map<string, Array<number>>();
+        const byTable = new Map<string, ReadonlyArray<ExportedRow>>();
         exported.set(threadId, byTable);
         const fingerprint = yield* read<Fingerprint>(fingerprintQuery, [threadId]);
         fingerprints.set(threadId, fingerprint[0]!);
@@ -709,29 +971,13 @@ const make = Effect.gen(function* () {
              WHERE ${shape.where} ORDER BY rowid`,
             [threadId],
           );
-          byTable.set(
-            shape.table,
-            ids.map((row) => row.r),
-          );
-          const batches: Array<Array<number>> = [];
-          let batchBytes = 0;
-          for (const row of ids) {
-            const last = batches.at(-1);
-            if (
-              last === undefined ||
-              last.length >= ROW_BATCH_COUNT ||
-              batchBytes + row.b > ROW_BATCH_BYTES
-            ) {
-              batches.push([row.r]);
-              batchBytes = row.b;
-            } else {
-              last.push(row.r);
-              batchBytes += row.b;
-            }
-            rowBytes += row.b;
-          }
+          const exportedRows = ids.map((row) => ({ rowid: row.r, bytes: row.b }));
+          byTable.set(shape.table, exportedRows);
+          for (const row of ids) rowBytes += row.b;
           const columns = shape.columns.map(quote).join(", ");
-          for (const batch of batches) {
+          for (const batch of batchRows(exportedRows, ROW_BATCH_COUNT, ROW_BATCH_BYTES).map(
+            (rows) => rows.map((row) => row.rowid),
+          )) {
             const rows = yield* read<Record<string, unknown>>(
               `SELECT rowid AS "__offload_rowid", ${columns} FROM ${quote(shape.table)}
                WHERE rowid IN (${batch.map(() => "?").join(",")}) ORDER BY rowid`,
@@ -750,7 +996,7 @@ const make = Effect.gen(function* () {
               yield* promise("Could not write the bundle", () => writer.writeLine(line));
               rowCount += 1;
             }
-            yield* Effect.yieldNow;
+            yield* yieldToEventLoop;
           }
         }
       }
@@ -777,6 +1023,7 @@ const make = Effect.gen(function* () {
   ) {
     const expected = options.expected;
     const reader = openBundleReader(bundlePath);
+    const pace = makePacer();
     return yield* Effect.gen(function* () {
       let header: BundleHeader | undefined;
       let trailer: typeof BundleTrailer.Type | undefined;
@@ -785,6 +1032,7 @@ const make = Effect.gen(function* () {
       while (true) {
         const line = yield* promise("Could not read the bundle", () => reader.next());
         if (line === undefined) break;
+        yield* pace(line.length);
         if (trailer !== undefined)
           return yield* fail("failed", "The bundle has lines after its end.");
         if (header === undefined) {
@@ -842,9 +1090,11 @@ const make = Effect.gen(function* () {
   const deleteThreadRows = Effect.fn("ThreadOffload.deleteThreadRows")(function* (input: {
     readonly threadId: ThreadId;
     readonly shapes: ReadonlyArray<TableShape>;
-    readonly rowids: ReadonlyMap<string, ReadonlyArray<number>>;
+    readonly rows: ReadonlyMap<string, ReadonlyArray<ExportedRow>>;
     readonly fingerprint: Fingerprint | undefined;
   }) {
+    const started = yield* Clock.currentTimeMillis;
+    let longestStatementMs = 0;
     yield* Effect.gen(function* () {
       const now = yield* sql.unsafe<Fingerprint>(fingerprintQuery, [input.threadId]);
       if (!sameFingerprint(input.fingerprint, now[0])) {
@@ -867,21 +1117,31 @@ const make = Effect.gen(function* () {
         return yield* fail("busy", `${input.threadId} holds the latest event; try again later.`);
       }
       for (const shape of input.shapes) {
-        const rowids = input.rowids.get(shape.table) ?? [];
+        const rows = input.rows.get(shape.table) ?? [];
         let deleted = 0;
-        for (const ids of chunk(rowids, ID_CHUNK)) {
+        // Each statement runs on the server's main thread: freeing a few screenshots at a time
+        // keeps it short, and other work runs between statements. Writes still wait for the
+        // transaction, which is one per thread so no reader ever sees half a thread.
+        for (const batch of batchRows(rows, ID_CHUNK, DELETE_BATCH_BYTES)) {
+          const ids = batch.map((row) => row.rowid);
+          const statementStarted = yield* Clock.currentTimeMillis;
           yield* sql.unsafe(
             `DELETE FROM ${quote(shape.table)} WHERE rowid IN (${ids.map(() => "?").join(",")})`,
             ids,
           );
           const changes = yield* sql<{ readonly n: number }>`SELECT changes() AS n`;
           deleted += changes[0]?.n ?? 0;
+          longestStatementMs = Math.max(
+            longestStatementMs,
+            (yield* Clock.currentTimeMillis) - statementStarted,
+          );
+          yield* yieldToEventLoop;
         }
         const left = yield* sql.unsafe<{ readonly n: number }>(
           `SELECT COUNT(*) AS n FROM ${quote(shape.table)} WHERE ${shape.where}`,
           [input.threadId],
         );
-        if (deleted !== rowids.length || (left[0]?.n ?? 0) !== 0) {
+        if (deleted !== rows.length || (left[0]?.n ?? 0) !== 0) {
           return yield* fail(
             "conflict",
             `${shape.table} rows of ${input.threadId} changed while being offloaded; nothing of it was removed.`,
@@ -889,6 +1149,12 @@ const make = Effect.gen(function* () {
         }
       }
     }).pipe(sql.withTransaction);
+    yield* Effect.logInfo("Offloaded a thread's rows", {
+      threadId: input.threadId,
+      rowCount: [...input.rows.values()].reduce((sum, rows) => sum + rows.length, 0),
+      writeLockMs: (yield* Clock.currentTimeMillis) - started,
+      longestStatementMs,
+    });
   });
 
   /**
@@ -909,7 +1175,7 @@ const make = Effect.gen(function* () {
 
   const offload: ThreadOffloadShape["offload"] = Effect.fn("ThreadOffload.offload")(
     function* (input) {
-      const initial = yield* loadCandidates(input.keepThreadIds);
+      const initial = yield* loadCandidates(input.keepThreadIds, input.threadId);
       if (!initial.threads.has(input.threadId)) {
         const record = yield* recordOf(input.threadId);
         return yield* fail(
@@ -923,7 +1189,7 @@ const make = Effect.gen(function* () {
       return yield* withThreadLocks(
         lockedIds,
         Effect.gen(function* () {
-          const candidates = yield* loadCandidates(input.keepThreadIds);
+          const candidates = yield* loadCandidates(input.keepThreadIds, input.threadId);
           const threadIds = unitOf(candidates, input.threadId);
           if (threadIds.some((threadId) => !lockedIds.includes(threadId))) {
             return yield* fail("conflict", `${input.threadId} gained threads; try again.`);
@@ -985,7 +1251,7 @@ const make = Effect.gen(function* () {
             yield* deleteThreadRows({
               threadId,
               shapes,
-              rowids: written.exported.get(threadId) ?? new Map(),
+              rows: written.exported.get(threadId) ?? new Map(),
               fingerprint: written.fingerprints.get(threadId),
             }).pipe(
               Effect.onError(() =>
@@ -1012,6 +1278,7 @@ const make = Effect.gen(function* () {
         }),
       );
     },
+    withDedicatedReader,
     Effect.mapError((cause) =>
       isThreadOffloadError(cause) ? cause : fail("failed", "Could not offload.", cause),
     ),
@@ -1026,7 +1293,7 @@ const make = Effect.gen(function* () {
     for (const spec of THREAD_TABLES) {
       if (header.tables[spec.table] === undefined) continue;
       const rows = yield* sql.unsafe<{ readonly n: number }>(
-        `SELECT EXISTS (SELECT 1 FROM ${quote(spec.table)} WHERE ${spec.where}) AS n`,
+        `SELECT EXISTS (SELECT 1 FROM ${quote(spec.table)} WHERE ${whereOf(spec)}) AS n`,
         [threadId],
       );
       if (rows[0]?.n === 1) holding.push(spec.table);
@@ -1082,6 +1349,7 @@ const make = Effect.gen(function* () {
   }) {
     let line = input.first;
     let inserted = 0;
+    const pace = makePacer();
     while (line !== undefined) {
       const decoded = yield* Effect.try({
         try: () => decodeLine(line!),
@@ -1115,6 +1383,7 @@ const make = Effect.gen(function* () {
         );
         inserted += 1;
       }
+      yield* pace(line.length);
       line = yield* promise("Could not read the bundle", () => input.reader.next());
     }
     return { next: undefined, inserted };
@@ -1174,6 +1443,7 @@ const make = Effect.gen(function* () {
             let line = yield* promise("Could not read the bundle", () => reader.next());
             for (const threadId of header.threadIds) {
               const insert = missing.has(threadId);
+              const started = yield* Clock.currentTimeMillis;
               const result = yield* Effect.gen(function* () {
                 // Writers that skip the command lock may have recreated it since the check.
                 if (insert && (yield* tablesHolding(header, threadId)).length > 0) {
@@ -1186,7 +1456,16 @@ const make = Effect.gen(function* () {
               }).pipe(insert ? sql.withTransaction : (effect) => effect);
               line = result.next;
               rowCount += result.inserted;
-              if (insert) restored.push(threadId);
+              if (insert) {
+                restored.push(threadId);
+                // Reading its rows from the bundle happens inside the transaction, so a large
+                // thread keeps other writes waiting for as long as it takes.
+                yield* Effect.logInfo("Restored a thread's rows", {
+                  threadId,
+                  rowCount: result.inserted,
+                  writeLockMs: (yield* Clock.currentTimeMillis) - started,
+                });
+              }
             }
           }).pipe(
             Effect.onError(() => announceChange.pipe(Effect.ignore)),

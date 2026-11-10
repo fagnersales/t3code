@@ -18,8 +18,16 @@ t3 thread prune-restored [--older-than-days 30] [--dry-run]   # delete bundles r
 
 It runs inside the running server (start T3 Code first): each thread is offloaded under the same
 per-thread command lock the orchestrator takes (the server hands it the orchestrator's own
-`ThreadCommandExecutor`; `runtimeLayer.test.ts` checks it), so no command writes to it meanwhile,
-and reads go through the server's reader connection.
+`ThreadCommandExecutor`; `runtimeLayer.test.ts` checks it), so no command writes to it meanwhile.
+
+Each plan or offload reads through a read-only SQLite worker of its own, not the server's shared
+reader: on a large database it reads gigabytes, and every other request (signing in included)
+would wait behind it. The plan reads each table once, in slices of 2,000 rowids, instead of a
+query per thread and table; an offload checks only its unit's threads. Exports read at most 4 MiB
+per statement and deletes free at most 16 MiB per statement, returning to the event loop between
+statements. A thread's delete stays one transaction, so no reader sees half a thread: other
+writes wait for it, about 1 s for a 2.7 GiB thread. A restore reads the bundle inside each
+thread's transaction, so writes wait for the whole thread (about a minute for 2.7 GiB).
 
 Some writers do not take that lock (provider sessions, command output, checkpoints, runs, the
 session importers). So the export notes each thread's event count, last event sequence and thread

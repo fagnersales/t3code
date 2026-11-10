@@ -482,6 +482,19 @@ const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
   });
 });
 
+/**
+ * A read-only connection on a worker of its own, for long background reads (thread offload) that
+ * would otherwise hold the shared reader every request waits on. Ends with the scope. Undefined
+ * when no worker can open the file, e.g. for an in-memory database or one not in WAL mode.
+ */
+export const makeDedicatedReader = (
+  filename: string,
+): Effect.Effect<Connection | undefined, never, Scope.Scope> =>
+  filename === "" || filename === ":memory:"
+    ? // @effect-diagnostics-next-line effectSucceedWithVoid:off - The connection result distinguishes undefined from void.
+      Effect.succeed(undefined)
+    : Effect.flatten(makeReader({ filename }));
+
 const CHECKPOINT_FRAMES = 1000;
 const CHECKPOINT_IDLE_MS = 100;
 const CHECKPOINT_BACKPRESSURE_FRAMES = 10 * CHECKPOINT_FRAMES;

@@ -238,6 +238,31 @@ it.effect("lets the writer commit while a read-only transaction is open", () =>
   ),
 );
 
+it.effect("gives a dedicated reader a read-only worker of its own", () =>
+  withReaderClient((sql) =>
+    Effect.gen(function* () {
+      const rows = yield* sql<{ readonly file: string }>`
+        SELECT file FROM pragma_database_list WHERE name = 'main'
+      `;
+      const workers = startedWorkers.length;
+      const counted = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const reader = yield* SqliteClient.makeDedicatedReader(rows[0]!.file);
+          assert.isDefined(reader);
+          yield* sql`INSERT INTO entries VALUES ('second')`;
+          yield* reader!
+            .execute("INSERT INTO entries VALUES ('third')", [], undefined)
+            .pipe(Effect.flip);
+          return yield* reader!.execute("SELECT COUNT(*) AS count FROM entries", [], undefined);
+        }),
+      );
+      assert.deepEqual(counted, [{ count: 2 }]);
+      assert.strictEqual(startedWorkers.length, workers + 1);
+      assert.isUndefined(yield* Effect.scoped(SqliteClient.makeDedicatedReader(":memory:")));
+    }),
+  ),
+);
+
 // regression: #19226 read-only transactions run on the separate reader connection
 it.effect("rejects a write in a read-only transaction", () =>
   withReaderClient((sql) =>
