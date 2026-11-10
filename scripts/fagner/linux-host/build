@@ -1,0 +1,85 @@
+#!/bin/bash
+# Build the Linux x64 app from a git bundle the Mac sent (scripts/fagner/linux build runs this).
+#
+#   build --version 0.1.5-nightly.20261029.3877-fagner.7 --commit SHA [--bundle FILE]
+#
+# The bundle's commit goes into $FAGNER_SRC (a git checkout kept between builds, so dependencies
+# install fast). Output: $FAGNER_LINUX_BUILDS/<version>/ with the AppImage and `app/`, the
+# AppImage extracted the way the AUR package installs it. Node, pnpm and Rust come from mise at
+# the versions package.json pins; nothing is activated globally.
+set -euo pipefail
+source "$(dirname "$0")/lib.sh"
+
+version="" commit="" bundle=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --version) version="$2"; shift ;;
+    --commit) commit="$2"; shift ;;
+    --bundle) bundle="$2"; shift ;;
+    -h | --help) sed -n '2,9p' "$0"; exit 0 ;;
+    *) die "Unknown option $1" ;;
+  esac
+  shift
+done
+[ -n "$version" ] && [ -n "$commit" ] || die "--version and --commit are required."
+case "$version" in *-nightly.*-fagner.[0-9]*) ;; *) die "Version '$version' must look like X-nightly.YYYYMMDD.N-fagner.N" ;; esac
+
+# electron-builder also makes a .deb with an fpm whose bundled ruby needs libcrypt.so.1.
+[ -e /usr/lib/libcrypt.so.1 ] ||
+  die "No libcrypt.so.1 for electron-builder's fpm. Install it: sudo pacman -S libxcrypt-compat"
+
+out="$FAGNER_LINUX_BUILDS/$version"
+[ ! -e "$out/app" ] || die "$out already has a build."
+
+[ -z "$bundle" ] || bundle="$(realpath "$bundle")"
+[ -d "$FAGNER_SRC/.git" ] || git init -q "$FAGNER_SRC"
+cd "$FAGNER_SRC"
+if [ -n "$bundle" ]; then
+  git bundle verify -q "$bundle" >/dev/null
+  git fetch -q "$bundle" HEAD
+fi
+git cat-file -e "$commit^{commit}" || die "Commit $commit is not in $FAGNER_SRC; send a bundle."
+git checkout -q --force --detach "$commit"
+# Fresh build outputs; keep installed dependencies.
+git clean -q -ffdx -e node_modules
+log "Building T3 Code (Fagner) $version (linux x64) from $(git rev-parse --short=10 HEAD)"
+
+node_version="$(sed -n 's/^ *"node": "\([0-9.]*\)".*/\1/p' package.json | head -1)"
+pnpm_version="$(sed -n 's/^ *"packageManager": "pnpm@\([0-9.]*\)".*/\1/p' package.json | head -1)"
+[ -n "$node_version" ] && [ -n "$pnpm_version" ] || die "package.json pins no node or pnpm version."
+mise install -q "node@$node_version" "pnpm@$pnpm_version" rust@stable
+PATH="$FAGNER_SRC/node_modules/.bin:$(mise where "node@$node_version")/bin:$(mise where "pnpm@$pnpm_version"):$(mise where rust@stable):$PATH"
+export PATH
+log "node $(node --version), pnpm $(pnpm --version), $(cargo --version)"
+
+pnpm install --frozen-lockfile
+
+# T3 Connect works only in builds that carry its public settings.
+set -a
+source scripts/fagner/public-config.env
+set +a
+mkdir -p "$out"
+# A repository variable here would make the build embed an update feed.
+env -u GITHUB_REPOSITORY -u T3CODE_DESKTOP_UPDATE_REPOSITORY \
+  node scripts/build-desktop-artifact.ts --platform linux --target AppImage --arch x64 \
+  --build-version "$version" --output-dir "$out"
+
+appimage="$(ls "$out"/*.AppImage | head -1)"
+[ -f "$appimage" ] || die "The build produced no AppImage in $out"
+chmod +x "$appimage"
+rm -rf "$out/squashfs-root"
+(cd "$out" && "$appimage" --appimage-extract >/dev/null)
+mv "$out/squashfs-root" "$out/app"
+app="$out/app"
+
+[ "$(app_version "$app")" = "$version" ] || die "The app reports '$(app_version "$app")', not $version"
+[ ! -e "$app/resources/app-update.yml" ] || die "The build has an update feed (app-update.yml)"
+[ -f "$app/resources/app.asar" ] || die "No app.asar in the build"
+cli=("$app/t3code" "$app/resources/app.asar/apps/server/dist/bin.mjs")
+ELECTRON_RUN_AS_NODE=1 "${cli[@]}" --version
+ELECTRON_RUN_AS_NODE=1 "${cli[@]}" thread group --help >/dev/null
+ELECTRON_RUN_AS_NODE=1 "${cli[@]}" thread follow --help >/dev/null
+echo "$commit" >"$out/commit"
+
+ln -sfn "$version" "$FAGNER_LINUX_BUILDS/latest"
+log "Ready: $app (latest -> $version)"
