@@ -784,6 +784,7 @@ function listItemFromShell(
 function threadDetail(
   scope: McpInvocationScope,
   projection: Pick<OrchestrationV2ThreadProjection, "thread" | "runs" | "runtimeRequests">,
+  runCount: number,
   itemCount: number,
   shell: OrchestrationV2ThreadShell,
   nowMs: number,
@@ -818,7 +819,7 @@ function threadDetail(
     worktreePath: projection.thread.worktreePath,
     parentThreadId: projection.thread.lineage.parentThreadId,
     relationshipToParent: projection.thread.lineage.relationshipToParent,
-    runCount: projection.runs.length,
+    runCount,
     itemCount,
     pendingRequestCount: projection.runtimeRequests.filter(
       (request) => request.status === "pending",
@@ -1050,27 +1051,6 @@ const make = Effect.gen(function* () {
         ),
       );
 
-  const loadProjectThread = (
-    projectId: OrchestrationV2ThreadProjection["thread"]["projectId"],
-    threadId: ThreadId,
-  ) =>
-    threadManagement
-      .getProjectThreadRecords(
-        { projectId, threadId },
-        [
-          "runs",
-          "messages",
-          "subagents",
-          "providerThreads",
-          "providerTurns",
-          "runtimeRequests",
-          "contextTransfers",
-          "turnItems",
-        ],
-        { turnItemTypes: [], messageRoles: ["user"] },
-      )
-      .pipe(Effect.mapError(threadManagementFailure));
-
   const loadCaller = Effect.fn("OrchestratorMcpService.loadCaller")(function* (
     scope: McpInvocationScope,
   ) {
@@ -1125,7 +1105,10 @@ const make = Effect.gen(function* () {
     if (shell === null || shell.deletedAt !== null) {
       return yield* threadNotFound(threadManagement, threadId, `Thread ${threadId} was not found.`);
     }
-    return yield* loadProjectThread(shell.projectId, threadId);
+    // Send, wait and interrupt read only the thread row; its records grow with every run.
+    return yield* threadManagement
+      .getProjectThreadRecords({ projectId: shell.projectId, threadId }, [])
+      .pipe(Effect.mapError(threadManagementFailure));
   });
 
   const loadScopedThread = Effect.fn("OrchestratorMcpService.loadScopedThread")(function* (
@@ -1202,11 +1185,12 @@ const make = Effect.gen(function* () {
       );
     }
     const target = yield* threadManagement
-      .getProjectThreadRecords({ projectId: shell.projectId, threadId }, [
-        "runs",
-        "runtimeRequests",
-        "contextTransfers",
-      ])
+      .getProjectThreadRecords(
+        { projectId: shell.projectId, threadId },
+        ["runs", "runtimeRequests", "contextTransfers"],
+        // readThread reads the runs it reports itself when there is no caller thread.
+        parent === undefined ? { runIds: [] } : undefined,
+      )
       .pipe(Effect.mapError(threadManagementFailure));
     return { parent, target, shell } as const;
   });
@@ -2886,17 +2870,34 @@ const make = Effect.gen(function* () {
           }
         }
       }
+      const runLimit = input.runLimit ?? DEFAULT_THREAD_RUN_LIMIT;
+      // Without a caller thread there are no tasks to settle, so the read loads only the runs it
+      // reports, picked from the timeline's run list.
+      const reportedRuns =
+        parent !== undefined
+          ? target.runs
+          : (yield* threadManagement
+              .getThreadRecords(input.threadId, ["runs"], {
+                runIds: [
+                  ...timeline.runs
+                    .toSorted((left, right) => right.ordinal - left.ordinal)
+                    .slice(0, Math.max(1, runLimit)),
+                  ...timeline.runs.filter((run) => ThreadManagementService.isActiveRun(run)),
+                ].map((run) => run.id),
+              })
+              .pipe(Effect.mapError(threadManagementFailure))).runs;
       return {
         thread: threadDetail(
           scope,
-          target,
+          { ...target, runs: reportedRuns },
+          parent !== undefined ? target.runs.length : timeline.runs.length,
           timeline.totalItems,
           shell,
           yield* Clock.currentTimeMillis,
         ),
-        recentRuns: target.runs
+        recentRuns: reportedRuns
           .toSorted((left, right) => right.ordinal - left.ordinal)
-          .slice(0, input.runLimit ?? DEFAULT_THREAD_RUN_LIMIT)
+          .slice(0, runLimit)
           .map(threadRun),
         items: page.map((row) =>
           timelineItem({

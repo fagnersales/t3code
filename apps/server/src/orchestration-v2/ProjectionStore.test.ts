@@ -1449,6 +1449,334 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
     }),
   );
   it.effect("record reads select subagents by id", () => subagentRecordsSelectById);
+  it.effect("send reads select the runs and turns a send decides on", () =>
+    Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const now = yield* DateTime.now;
+      const threadId = ThreadId.make("thread:send-reads");
+      const activeProviderThreadId = ProviderThreadId.make("provider-thread:send-reads:active");
+      const otherProviderThreadId = ProviderThreadId.make("provider-thread:send-reads:other");
+      yield* store.apply({
+        id: EventId.make("event:send-reads:thread"),
+        type: "thread.created",
+        threadId,
+        occurredAt: now,
+        payload: {
+          createdBy: "user",
+          creationSource: "web",
+          id: threadId,
+          projectId: ProjectId.make("project:send-reads"),
+          title: "Send reads",
+          providerInstanceId,
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          activeProviderThreadId,
+          lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+          forkedFrom: null,
+          createdAt: now,
+          updatedAt: now,
+          archivedAt: null,
+          settledOverride: null,
+          settledAt: null,
+          lastVisitedAt: null,
+          deletedAt: null,
+        },
+      });
+      for (const id of [activeProviderThreadId, otherProviderThreadId]) {
+        yield* store.apply({
+          id: EventId.make(`event:send-reads:${id}`),
+          type: "provider-thread.updated",
+          threadId,
+          driver,
+          providerInstanceId,
+          occurredAt: now,
+          payload: {
+            id,
+            driver,
+            providerInstanceId,
+            providerSessionId: null,
+            appThreadId: threadId,
+            ownerNodeId: null,
+            nativeThreadRef: null,
+            nativeConversationHeadRef: null,
+            status: "not_loaded",
+            firstRunOrdinal: null,
+            lastRunOrdinal: null,
+            handoffIds: [],
+            forkedFrom: null,
+            createdAt: now,
+            updatedAt: now,
+          },
+        });
+      }
+      // Run 1 is rolled back with a command still running; run 3 waits in the queue.
+      const statuses = ["rolled_back", "completed", "queued", "completed", "completed"] as const;
+      const runIds = statuses.map((_, index) => RunId.make(`run:send-reads:${index + 1}`));
+      const messageIds = statuses.map((_, index) =>
+        MessageId.make(`message:send-reads:${index + 1}`),
+      );
+      for (const [index, status] of statuses.entries()) {
+        const rootNodeId = NodeId.make(`node:send-reads:${index + 1}`);
+        yield* store.apply({
+          id: EventId.make(`event:send-reads:run:${index + 1}`),
+          type: "run.created",
+          threadId,
+          runId: runIds[index]!,
+          nodeId: rootNodeId,
+          driver,
+          providerInstanceId,
+          occurredAt: now,
+          payload: {
+            id: runIds[index]!,
+            threadId,
+            ordinal: index + 1,
+            providerInstanceId,
+            modelSelection,
+            providerThreadId: activeProviderThreadId,
+            userMessageId: messageIds[index]!,
+            rootNodeId,
+            activeAttemptId: null,
+            status,
+            requestedAt: now,
+            startedAt: now,
+            completedAt: null,
+            checkpointId: null,
+            contextHandoffId: null,
+          },
+        });
+        yield* store.apply({
+          id: EventId.make(`event:send-reads:message:${index + 1}`),
+          type: "message.updated",
+          threadId,
+          runId: runIds[index]!,
+          nodeId: rootNodeId,
+          occurredAt: now,
+          payload: {
+            createdBy: "user",
+            creationSource: "web",
+            id: messageIds[index]!,
+            threadId,
+            runId: runIds[index]!,
+            nodeId: rootNodeId,
+            role: "user",
+            text: `Turn ${index + 1}`,
+            attachments: [],
+            streaming: false,
+            createdAt: now,
+            updatedAt: now,
+          },
+        });
+        yield* store.apply({
+          id: EventId.make(`event:send-reads:user-item:${index + 1}`),
+          type: "turn-item.updated",
+          threadId,
+          runId: runIds[index]!,
+          nodeId: rootNodeId,
+          driver,
+          occurredAt: now,
+          payload: {
+            id: TurnItemId.make(`item:send-reads:user:${index + 1}`),
+            threadId,
+            // The steered message's item belongs to another run than its message.
+            runId: runIds[index === 4 ? 3 : index]!,
+            nodeId: rootNodeId,
+            providerThreadId: null,
+            providerTurnId: null,
+            nativeItemRef: null,
+            parentItemId: null,
+            // Message 2's item comes after message 3's, so order follows items, not ids.
+            ordinal: index === 1 ? 35 : (index + 1) * 10,
+            status: "completed",
+            title: `Turn ${index + 1}`,
+            startedAt: now,
+            completedAt: now,
+            updatedAt: now,
+            type: "user_message",
+            createdBy: "user",
+            creationSource: "web",
+            messageId: messageIds[index]!,
+            inputIntent: index === 4 ? "steer" : index === 2 ? "queued_turn" : "turn_start",
+            text: `Turn ${index + 1}`,
+            attachments: [],
+          },
+        });
+      }
+      yield* store.apply({
+        id: EventId.make("event:send-reads:command"),
+        type: "turn-item.updated",
+        threadId,
+        runId: runIds[0]!,
+        nodeId: NodeId.make("node:send-reads:1"),
+        driver,
+        occurredAt: now,
+        payload: {
+          id: TurnItemId.make("item:send-reads:command"),
+          threadId,
+          runId: runIds[0]!,
+          nodeId: NodeId.make("node:send-reads:1"),
+          providerThreadId: null,
+          providerTurnId: null,
+          nativeItemRef: null,
+          parentItemId: null,
+          ordinal: 11,
+          status: "running",
+          title: "background command",
+          startedAt: now,
+          completedAt: null,
+          updatedAt: now,
+          type: "command_execution",
+          input: "sleep 60",
+        },
+      });
+      // As strings, 10:00+02:00 sorts after 09:00Z, but it is an hour earlier.
+      const turns = [
+        {
+          providerThreadId: activeProviderThreadId,
+          status: "completed",
+          usedAt: "2026-01-01T09:00:00Z",
+        },
+        {
+          providerThreadId: activeProviderThreadId,
+          status: "completed",
+          usedAt: "2026-01-01T10:00:00+02:00",
+        },
+        { providerThreadId: activeProviderThreadId, status: "completed", usedAt: undefined },
+        { providerThreadId: activeProviderThreadId, status: "running", usedAt: undefined },
+        {
+          providerThreadId: otherProviderThreadId,
+          status: "completed",
+          usedAt: "2026-01-02T00:00:00Z",
+        },
+      ] as const;
+      const turnIds = turns.map((_, index) =>
+        ProviderTurnId.make(`provider-turn:send-reads:${index + 1}`),
+      );
+      for (const [index, turn] of turns.entries()) {
+        yield* store.apply({
+          id: EventId.make(`event:send-reads:turn:${index + 1}`),
+          type: "provider-turn.updated",
+          threadId,
+          nodeId: NodeId.make("node:send-reads:4"),
+          driver,
+          occurredAt: now,
+          payload: {
+            id: turnIds[index]!,
+            providerThreadId: turn.providerThreadId,
+            nodeId: NodeId.make("node:send-reads:4"),
+            runAttemptId: null,
+            nativeTurnRef: null,
+            ordinal: index + 1,
+            status: turn.status,
+            startedAt: now,
+            completedAt: null,
+            ...(turn.usedAt === undefined
+              ? {}
+              : { tokenUsage: { usedTokens: 150_000, updatedAt: turn.usedAt } }),
+          },
+        });
+      }
+
+      const sendReads = yield* store.getThreadRecords(
+        threadId,
+        ["runs", "providerThreads", "providerTurns", "turnItems"],
+        {
+          unfinishedBackgroundItems: true,
+          latestRunOrStatuses: ["queued", "preparing", "starting", "running", "waiting"],
+          activeProviderThreadOnly: true,
+          newestUsageTurnOrStatuses: ["running"],
+        },
+      );
+      assert.deepEqual(
+        sendReads.runs.map((run) => run.id),
+        [runIds[0], runIds[2], runIds[4]],
+      );
+      assert.deepEqual(
+        sendReads.turnItems.map((item) => item.id),
+        [TurnItemId.make("item:send-reads:command")],
+      );
+      assert.deepEqual(
+        sendReads.providerThreads.map((thread) => thread.id),
+        [activeProviderThreadId],
+      );
+      assert.deepEqual(
+        sendReads.providerTurns.map((turn) => turn.id),
+        [turnIds[0], turnIds[3]],
+      );
+
+      const sent = yield* store.getThreadRecords(threadId, ["runs", "messages", "turnItems"], {
+        messageIds: [messageIds[4]!],
+        runMessageIds: [messageIds[4]!],
+        userMessageItemIds: [messageIds[4]!],
+      });
+      assert.deepEqual(
+        sent.runs.map((run) => run.id),
+        [runIds[4]],
+      );
+      assert.deepEqual(
+        sent.turnItems.map((item) => item.id),
+        [TurnItemId.make("item:send-reads:user:5")],
+      );
+
+      const messagePage = () =>
+        store
+          .getTimelinePage(threadId, { view: "messages", limit: 10 })
+          .pipe(Effect.map((page) => page.items.map((row) => row.sourceItemId)));
+      const userItemIds = statuses.map((_, index) =>
+        TurnItemId.make(`item:send-reads:user:${index + 1}`),
+      );
+      // Command reads take message order from the items they read; others ask SQLite.
+      const { statements, tracer } = traceSqlStatements();
+      const commandRead = yield* store
+        .getThreadRecords(threadId, ["messages", "turnItems"], {
+          turnItemTypes: ["user_message", "error"],
+          messageRoles: ["user"],
+        })
+        .pipe(Effect.withTracer(tracer));
+      assert.isNotEmpty(statements);
+      assert.isFalse(statements.some((statement) => statement.includes("GROUP BY")));
+      const messageOrder = [
+        messageIds[0],
+        messageIds[2],
+        messageIds[1],
+        messageIds[3],
+        messageIds[4],
+      ];
+      assert.deepEqual(
+        commandRead.messages.map((message) => message.id),
+        messageOrder,
+      );
+      assert.deepEqual(
+        (yield* store.getThreadRecords(threadId, ["messages", "turnItems"], {
+          turnItemTypes: ["error"],
+          messageRoles: ["user"],
+        })).messages.map((message) => message.id),
+        messageOrder,
+      );
+
+      // Rolled-back run 1 stays hidden; queued input shows until its run is cancelled.
+      assert.deepEqual(yield* messagePage(), [
+        userItemIds[2],
+        userItemIds[1],
+        userItemIds[3],
+        userItemIds[4],
+      ]);
+      const [queued] = (yield* store.getThreadRecords(threadId, ["runs"], { runIds: [runIds[2]!] }))
+        .runs;
+      yield* store.apply({
+        id: EventId.make("event:send-reads:cancel-queued"),
+        type: "run.updated",
+        threadId,
+        runId: runIds[2]!,
+        driver,
+        occurredAt: now,
+        payload: { ...queued!, status: "cancelled", completedAt: now },
+      });
+      assert.deepEqual(yield* messagePage(), [userItemIds[1], userItemIds[3], userItemIds[4]]);
+    }),
+  );
   it.effect(
     "command reads skip finished leaf nodes of finished runs",
     () => commandReadsSkipSettledLeafNodes,

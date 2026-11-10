@@ -51,7 +51,7 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
 import * as CommandReceiptStore from "./CommandReceiptStore.ts";
-import { shouldCompactBeforeSend } from "./IdleCompaction.ts";
+import { shouldCompactBeforeSend, UNFINISHED_RUN_STATUSES } from "./IdleCompaction.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import { projectedRowEncodedBytes } from "./threadHistoryPaging.ts";
@@ -485,7 +485,7 @@ export class ThreadManagementService extends Context.Service<
   ThreadManagementServiceShape
 >()("t3/orchestration-v2/ThreadManagementService") {}
 
-export function isActiveRun(run: OrchestrationV2Run): boolean {
+export function isActiveRun(run: Pick<OrchestrationV2Run, "status">): boolean {
   return (
     run.status === "preparing" ||
     run.status === "starting" ||
@@ -776,6 +776,8 @@ const make = Effect.gen(function* () {
   const sendToThread: ThreadManagementServiceShape["sendToThread"] = Effect.fn(
     "ThreadManagementService.sendToThread",
   )(function* (input) {
+    // Steering and the compaction check read only the latest and unfinished runs and turns, so a
+    // send costs the same on a thread with thousands of runs.
     const target = yield* getProjectThreadRecords(
       input,
       input.compactIfCold === true
@@ -789,8 +791,17 @@ const make = Effect.gen(function* () {
           ]
         : ["runs", "providerTurns"],
       input.compactIfCold === true
-        ? { turnItemStatuses: ["pending", "running", "waiting"] }
-        : undefined,
+        ? {
+            // The only items the compaction check reads (pendingBackgroundTurnItems).
+            unfinishedBackgroundItems: true,
+            latestRunOrStatuses: UNFINISHED_RUN_STATUSES,
+            activeProviderThreadOnly: true,
+            newestUsageTurnOrStatuses: ["running"],
+          }
+        : {
+            latestRunOrStatuses: UNFINISHED_RUN_STATUSES,
+            newestUsageTurnOrStatuses: ["running"],
+          },
     );
     if (target.thread.archivedAt !== null) {
       return yield* new ThreadManagementThreadArchivedError({
@@ -868,7 +879,8 @@ const make = Effect.gen(function* () {
     });
     const projection = yield* getProjectThreadRecords(input, ["runs", "messages", "turnItems"], {
       messageIds: [input.messageId],
-      turnItemTypes: ["user_message"],
+      runMessageIds: [input.messageId],
+      userMessageItemIds: [input.messageId],
     });
     const message = projection.messages.find((candidate) => candidate.id === input.messageId);
     const run =

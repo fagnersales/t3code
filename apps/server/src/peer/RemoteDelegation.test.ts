@@ -391,6 +391,7 @@ const boxToolkitLayer = (thread: BoxThread) => {
             visible.some((entry) => entry.position > matching.at(-1)!.position),
           hasEarlier:
             matching.length > 0 && visible.some((entry) => entry.position < matching[0]!.position),
+          runs: (yield* projectionOf(threadId)).runs,
         };
       }),
     interruptThread: (input) =>
