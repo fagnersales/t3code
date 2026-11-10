@@ -57,7 +57,8 @@ running_app_pids() {
     pid="${dir#/proc/}"
     exe="$(readlink "$dir/exe" 2>/dev/null)" || continue
     is_t3_exe "$exe" || continue
-    tr '\0' '\n' <"$dir/cmdline" 2>/dev/null | grep -q -- '^--type=' && continue
+    # Chromium rewrites its helpers' arguments into one string, so search the whole line.
+    grep -qa -- '--type=' "$dir/cmdline" 2>/dev/null && continue
     tr '\0' '\n' <"$dir/environ" 2>/dev/null | grep -qx 'ELECTRON_RUN_AS_NODE=1' && continue
     echo "$pid"
   done
@@ -69,7 +70,7 @@ running_server_pids() {
   for dir in /proc/[0-9]*; do
     exe="$(readlink "$dir/exe" 2>/dev/null)" || continue
     is_t3_exe "$exe" || continue
-    tr '\0' '\n' <"$dir/cmdline" 2>/dev/null | grep -qx -- '--bootstrap-fd' && echo "${dir#/proc/}"
+    grep -qa -- '--bootstrap-fd' "$dir/cmdline" 2>/dev/null && echo "${dir#/proc/}"
   done
 }
 
@@ -215,7 +216,8 @@ launch_app() {
   session_env
   for attempt in 1 2 3 4 5; do
     if command -v uwsm >/dev/null; then
-      uwsm app -- "$LAUNCHER_ID" >/dev/null 2>&1 || log "uwsm app -- $LAUNCHER_ID failed"
+      # uwsm app waits for the app to exit, so it gets its own session.
+      setsid -f uwsm app -- "$LAUNCHER_ID" >/dev/null 2>&1 </dev/null
     else
       setsid -f "$dir/AppRun" >/dev/null 2>&1 </dev/null
     fi
