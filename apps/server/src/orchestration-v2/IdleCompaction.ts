@@ -5,6 +5,7 @@ import type {
   OrchestrationV2ThreadProjection,
   ProviderInstanceId,
 } from "@t3tools/contracts";
+import { OrchestrationV2RunStatus } from "@t3tools/contracts";
 import {
   COMPACTION_SUGGESTION_MIN_TOKENS,
   hasDismissedResumeCompaction,
@@ -113,6 +114,11 @@ const IDLE_RUN_STATUSES: ReadonlySet<OrchestrationV2Run["status"]> = new Set([
   "interrupted",
   "rolled_back",
 ]);
+
+/** With the latest run, the runs `shouldCompactBeforeSend` and steering look at. */
+export const UNFINISHED_RUN_STATUSES = OrchestrationV2RunStatus.literals.filter(
+  (status) => !IDLE_RUN_STATUSES.has(status),
+);
 
 /**
  * Whether a message sent to this thread should go behind a `/compact` run, the rule T3's window
