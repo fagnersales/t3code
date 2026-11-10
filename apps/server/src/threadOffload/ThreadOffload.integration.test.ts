@@ -461,6 +461,11 @@ describe("ThreadOffload", () => {
               }),
             );
           }
+          // The plan's one pass per table counts each unit as its export does.
+          assert.deepEqual(
+            units.map((unit) => unit.rowBytes),
+            plan.units.map((unit) => unit.bytes),
+          );
           assert.isTrue((yield* maintenance.verify).valid);
           const remaining = yield* sql<{ readonly thread_id: string }>`
             SELECT thread_id FROM orchestration_v2_projection_threads
