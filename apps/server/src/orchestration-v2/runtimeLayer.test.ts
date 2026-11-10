@@ -86,6 +86,7 @@ import * as TerminalManager from "../terminal/Manager.ts";
 import * as ResourceCleanupService from "./ResourceCleanupService.ts";
 import * as ThreadLaunchService from "./ThreadLaunchService.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
+import * as ThreadOffload from "../threadOffload/ThreadOffload.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 
 const layerPlatformTest = Layer.merge(
@@ -335,6 +336,8 @@ const layerProjectDeletionTest = Layer.mergeAll(
   RuntimeLayer.layerProjectService,
   RuntimeLayer.layerEventSink,
   ThreadCommandExecutor.layer,
+  // As the server wires it: the executor layer it is given is the orchestrator's, by memoization.
+  ThreadOffload.layer.pipe(Layer.provide(ThreadCommandExecutor.layer)),
 ).pipe(
   Layer.provide(
     Layer.mock(ProjectEnrichmentService.ProjectEnrichmentService)({
@@ -593,6 +596,57 @@ it.layer(layerProjectDeletionTest)("project deletion during thread commands", (i
           }),
         ),
       );
+    }),
+  );
+
+  it.effect("offloads threads under the orchestrator's own command lock", () =>
+    Effect.gen(function* () {
+      const projects = yield* ProjectService.ProjectService;
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const executor = yield* ThreadCommandExecutor.ThreadCommandExecutor;
+      const offload = yield* ThreadOffload.ThreadOffload;
+      const projectId = ProjectId.make("runtime-project-offload-lock");
+      const threadId = ThreadId.make("runtime-thread-offload-lock");
+      yield* projects.create({
+        commandId: CommandId.make("runtime-project-offload-lock-create"),
+        projectId,
+        title: "Offload lock",
+        workspaceRoot: "/work/offload-lock",
+      });
+      const locked: Array<string> = [];
+      const withLock = executor.withLock;
+      const recordLock: ThreadCommandExecutor.ThreadCommandExecutor["Service"]["withLock"] = (
+        key,
+        effect,
+      ) => {
+        locked.push(key);
+        return withLock(key, effect);
+      };
+      const lockSpy = vi.spyOn(executor, "withLock").mockImplementation(recordLock);
+      yield* Effect.gen(function* () {
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make("runtime-thread-offload-lock-create"),
+          createdBy: "user",
+          creationSource: "web",
+          threadId,
+          projectId,
+          title: "Offload lock",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+        });
+        const byOrchestrator = locked.filter((key) => key === threadId).length;
+        assert.isAbove(byOrchestrator, 0);
+        // The thread holds the newest event, so it stays; the lock was taken to find that out.
+        const kept = yield* offload
+          .offload({ threadId, before: "9999-01-01T00:00:00.000Z", keepThreadIds: new Set() })
+          .pipe(Effect.flip);
+        assert.equal(kept.reason, "busy");
+        assert.isAbove(locked.filter((key) => key === threadId).length, byOrchestrator);
+      }).pipe(Effect.ensuring(Effect.sync(() => lockSpy.mockRestore())));
     }),
   );
 });

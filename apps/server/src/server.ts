@@ -155,6 +155,8 @@ import * as ThreadFeedHttp from "./threadFeed/http.ts";
 import * as ProjectFeed from "./projectFeed/ProjectFeed.ts";
 import * as ProjectFeedHttp from "./projectFeed/http.ts";
 import * as ThreadGroupsHttp from "./threadGroups/http.ts";
+import * as ThreadOffload from "./threadOffload/ThreadOffload.ts";
+import * as ThreadOffloadHttp from "./threadOffload/http.ts";
 import * as CloudLink from "./cloud/CloudLink.ts";
 import * as ConnectReachability from "./cloud/ConnectReachability.ts";
 import { pendingServiceUpdateExists } from "./cloud/updateHandoff.ts";
@@ -191,6 +193,7 @@ import * as CursorUsageAccounts from "@t3tools/provider-cursor/server/CursorUsag
 import * as UsageService from "./usage/UsageService.ts";
 import * as CodexUsageHistory from "./usage/CodexUsageHistory.ts";
 import * as RuntimeLayer from "./orchestration-v2/runtimeLayer.ts";
+import * as ThreadCommandExecutor from "./orchestration-v2/ThreadCommandExecutor.ts";
 import * as ProjectStore from "./orchestration-v2/ProjectStore.ts";
 import * as ThreadSearch from "./orchestration-v2/ThreadSearch.ts";
 import * as ThreadSettlementService from "./orchestration-v2/ThreadSettlementService.ts";
@@ -523,6 +526,9 @@ const layerScheduledTaskWebhookOrigin = Layer.effect(
 );
 
 const layerOrchestrationV2Runtime = RuntimeLayer.layerProduction.pipe(
+  // The orchestrator's per-thread command lock (one instance, by layer memoization), so thread
+  // offloading takes the very lock commands take.
+  Layer.provideMerge(ThreadCommandExecutor.layer),
   Layer.provide(layerScheduledTaskWebhookOrigin),
   Layer.provide(ProviderEventIngestor.layerAnalytics),
   Layer.provide(layerCheckpointStore),
@@ -740,6 +746,7 @@ const layerMakeRoutes = Layer.mergeAll(
     ThreadFeedHttp.layer.pipe(Layer.provide(ThreadFeed.layer)),
     ProjectFeedHttp.layer.pipe(Layer.provide(ProjectFeed.layer)),
     ThreadGroupsHttp.layer,
+    ThreadOffloadHttp.layer,
     DeviceHubProxy.layer,
     ServerBrowserStream.routeLayer,
     ServerHttp.layerStaticAndDevRoute,
@@ -759,6 +766,8 @@ const layerMakeRoutes = Layer.mergeAll(
   ),
   // delegate_task to a linked environment, from /mcp and the follower above.
   Layer.provide(RemoteDelegation.layer.pipe(Layer.provide(ProjectionStoreV2.layer))),
+  // One instance for the HTTP routes and the shell stream, which resyncs clients after offloads.
+  Layer.provide(ThreadOffload.layer),
   // Links agents ask for: shown in a thread from /mcp, answered over WebSocket.
   Layer.provide(PeerLinkRequests.layer),
   // Share the service so HTTP/WS clients single-flight reads and invalidate each other's cached patches.
