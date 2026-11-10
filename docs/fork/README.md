@@ -19,6 +19,9 @@ Fagner's T3 Code: the Nightly he ran, plus live thread and project feeds for Hea
   until the eye button in its header shows them; the open thread always stays listed.
   Headquarters keeps its group, `Headquarters`, equal to the threads it follows. A settings key,
   not a migration: an older build ignores it.
+- **Thread offload:** `t3 thread offload` moves threads idle for 7+ days, with their subagents
+  and forks, out of the database into compressed files under `~/.t3/offload/`; `t3 thread restore`
+  puts one back exactly. Runs inside the running server. See [thread-offload.md](thread-offload.md).
 - **Build identity:** versions `<nightly>-fagner.N`, app name `T3 Code (Fagner)`, no update feed
   (the updater reports updates as unavailable, so nothing can replace it with upstream).
 

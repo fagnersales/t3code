@@ -155,6 +155,8 @@ import * as ThreadFeedHttp from "./threadFeed/http.ts";
 import * as ProjectFeed from "./projectFeed/ProjectFeed.ts";
 import * as ProjectFeedHttp from "./projectFeed/http.ts";
 import * as ThreadGroupsHttp from "./threadGroups/http.ts";
+import * as ThreadOffload from "./threadOffload/ThreadOffload.ts";
+import * as ThreadOffloadHttp from "./threadOffload/http.ts";
 import * as CloudLink from "./cloud/CloudLink.ts";
 import * as ConnectReachability from "./cloud/ConnectReachability.ts";
 import { pendingServiceUpdateExists } from "./cloud/updateHandoff.ts";
@@ -740,6 +742,7 @@ const layerMakeRoutes = Layer.mergeAll(
     ThreadFeedHttp.layer.pipe(Layer.provide(ThreadFeed.layer)),
     ProjectFeedHttp.layer.pipe(Layer.provide(ProjectFeed.layer)),
     ThreadGroupsHttp.layer,
+    ThreadOffloadHttp.layer,
     DeviceHubProxy.layer,
     ServerBrowserStream.routeLayer,
     ServerHttp.layerStaticAndDevRoute,
@@ -759,6 +762,8 @@ const layerMakeRoutes = Layer.mergeAll(
   ),
   // delegate_task to a linked environment, from /mcp and the follower above.
   Layer.provide(RemoteDelegation.layer.pipe(Layer.provide(ProjectionStoreV2.layer))),
+  // One instance for the HTTP routes and the shell stream, which resyncs clients after offloads.
+  Layer.provide(ThreadOffload.layer),
   // Links agents ask for: shown in a thread from /mcp, answered over WebSocket.
   Layer.provide(PeerLinkRequests.layer),
   // Share the service so HTTP/WS clients single-flight reads and invalidate each other's cached patches.

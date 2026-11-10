@@ -38,6 +38,7 @@ import { readPersistedServerRuntimeState } from "../serverRuntimeState.ts";
 import { projectLocationFlags, resolveCliAuthConfig } from "./config.ts";
 import { threadFollowCommand } from "./threadFollow.ts";
 import { threadGroupCommand } from "./threadGroup.ts";
+import { offloadNotice, threadOffloadCommand, threadRestoreCommand } from "./threadOffload.ts";
 
 /**
  * Short enough that a run which stops to ask the user something is noticed
@@ -843,6 +844,17 @@ const threadShowCommand = Command.make("show", {
             yield* Console.log(`\n[${entry.role}]\n${entry.text}`);
           }
         }),
+      ).pipe(
+        Effect.catchTags({
+          ThreadToolFailedError: Effect.fn("cli.thread.show.offloaded")(function* (error) {
+            const logLevel = yield* GlobalFlag.LogLevel;
+            const config = yield* resolveCliAuthConfig(flags, logLevel);
+            const notice = yield* offloadNotice(config.baseDir, threadId);
+            return yield* Option.isSome(notice)
+              ? new ThreadToolFailedError({ tool: error.tool, detail: notice.value })
+              : error;
+          }),
+        }),
       );
     }).pipe(reportThreadErrors),
   ),
@@ -857,5 +869,7 @@ export const threadCommand = Command.make("thread").pipe(
     threadShowCommand,
     threadFollowCommand,
     threadGroupCommand,
+    threadOffloadCommand,
+    threadRestoreCommand,
   ]),
 );

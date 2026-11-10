@@ -11,6 +11,7 @@ import {
   WsServerRefreshProvidersRpc,
   WsSubscribeServerConfigRpc,
   type OrchestrationV2StoredEvent,
+  type OrchestrationV2ShellStreamItem,
   type OrchestrationV2ThreadShell,
   type OrchestrationProjectShell,
   type ServerConfig,
@@ -18,6 +19,7 @@ import {
   type ServerProvider,
 } from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -113,6 +115,7 @@ import * as EventStore from "./orchestration-v2/EventStore.ts";
 import * as ProjectionMaintenance from "./orchestration-v2/ProjectionMaintenance.ts";
 import * as ProjectionStore from "./orchestration-v2/ProjectionStore.ts";
 import * as ThreadManagement from "./orchestration-v2/ThreadManagementService.ts";
+import * as ThreadOffload from "./threadOffload/ThreadOffload.ts";
 import * as ProjectStore from "./orchestration-v2/ProjectStore.ts";
 import * as OrchestrationEventStore from "./persistence/OrchestrationEventStore.ts";
 import * as SqlitePersistence from "./persistence/Sqlite.ts";
@@ -461,6 +464,94 @@ it.effect("shell snapshots omit idle children and older settled threads only on 
     assert.deepEqual(withoutOld?.olderSettled?.counts, [
       { projectId: ProjectId.make("project"), count: 1 },
     ]);
+  }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);
+
+it.effect("offloading threads sends shells a fresh snapshot, live and on resume", () =>
+  Effect.gen(function* () {
+    const shell = (id: string) =>
+      ({
+        id: ThreadId.make(id),
+        projectId: "project",
+        archivedAt: null,
+        status: "completed",
+        activityRunStatus: null,
+        pendingRuntimeRequest: null,
+        pendingBackgroundTasks: [],
+        settledOverride: null,
+        settledAt: null,
+        lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: id },
+      }) as unknown as OrchestrationV2ThreadShell;
+    let threads = [shell("kept"), shell("offloaded")];
+    const offloaded = yield* Deferred.make<void>();
+    const firstSeen = yield* Deferred.make<void>();
+    const withServices = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+      effect.pipe(
+        Effect.provideService(ThreadManagement.ThreadManagementService, {
+          readShellSnapshot: () =>
+            Effect.sync(() =>
+              Effect.succeed({
+                schemaVersion: 1,
+                snapshotSequence: 0,
+                threads,
+                archivedThreads: [],
+              }),
+            ),
+          listActiveSubagentThreadIds: () => Effect.succeed([]),
+        } as unknown as ThreadManagement.ThreadManagementService["Service"]),
+        Effect.provideService(ThreadOffload.ThreadOffload, {
+          shellResyncSequence: Effect.succeed(7),
+          shellResyncs: Stream.fromEffect(Deferred.await(offloaded)),
+        } as unknown as ThreadOffload.ThreadOffload["Service"]),
+        Effect.provideService(ProjectStore.ProjectStoreV2, {
+          listShells: () => Effect.succeed([]),
+        } as unknown as ProjectStore.ProjectStoreV2["Service"]),
+        Effect.provideService(ProjectService.ProjectService, {
+          getShell: () => Effect.succeedNone,
+        } as unknown as ProjectService.ProjectService["Service"]),
+        Effect.provideServiceEffect(
+          ProjectEnrichment.ProjectEnrichmentService,
+          PubSub.unbounded().pipe(
+            Effect.map(
+              (changes) =>
+                ({
+                  subscribeChanges: PubSub.subscribe(changes),
+                }) as unknown as ProjectEnrichment.ProjectEnrichmentService["Service"],
+            ),
+          ),
+        ),
+      );
+    const threadIds = (item: OrchestrationV2ShellStreamItem | undefined) =>
+      item?.kind === "snapshot" && item.resolvedRepositoryIdentityRoots === undefined
+        ? item.snapshot.threads.map((thread) => thread.id)
+        : null;
+
+    yield* withServices(
+      Effect.gen(function* () {
+        const live = yield* subscribeOrchestrationV2Shell({}).pipe(
+          Effect.flatMap((stream) =>
+            stream.pipe(
+              Stream.tap(() => Deferred.succeed(firstSeen, undefined)),
+              Stream.take(2),
+              Stream.runCollect,
+            ),
+          ),
+          Effect.forkScoped,
+        );
+        yield* Deferred.await(firstSeen);
+        threads = [shell("kept")];
+        yield* Deferred.succeed(offloaded, undefined);
+        const [before, after] = yield* Fiber.join(live);
+        assert.deepEqual(threadIds(before), ["kept", "offloaded"]);
+        assert.deepEqual(threadIds(after), ["kept"]);
+
+        // A cursor from before the offload would replay events that never mention it.
+        const [resumed] = yield* subscribeOrchestrationV2Shell({ afterSequence: 7 }).pipe(
+          Effect.flatMap((stream) => stream.pipe(Stream.take(1), Stream.runCollect)),
+        );
+        assert.deepEqual(threadIds(resumed), ["kept"]);
+      }),
+    );
   }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
 );
 
