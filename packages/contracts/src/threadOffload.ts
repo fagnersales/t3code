@@ -85,7 +85,11 @@ export const ThreadOffloadResult = Schema.Struct({
 });
 export type ThreadOffloadResult = typeof ThreadOffloadResult.Type;
 
-export const ThreadRestoreRequest = Schema.Struct({ threadId: ThreadId });
+export const ThreadRestoreRequest = Schema.Union([
+  Schema.Struct({ threadId: ThreadId }),
+  /** An absolute path, for a bundle whose records are lost. */
+  Schema.Struct({ bundlePath: Schema.String }),
+]);
 export type ThreadRestoreRequest = typeof ThreadRestoreRequest.Type;
 
 export const ThreadRestoreResult = Schema.Struct({
@@ -93,6 +97,8 @@ export const ThreadRestoreResult = Schema.Struct({
   /** Threads put back; members that were never removed are left as they are. */
   threadIds: Schema.Array(ThreadId),
   rowCount: NonNegativeInt,
+  /** Where the bundle is kept: restore never deletes one. */
+  bundlePath: Schema.String,
 });
 export type ThreadRestoreResult = typeof ThreadRestoreResult.Type;
 

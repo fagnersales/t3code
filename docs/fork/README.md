@@ -21,7 +21,8 @@ Fagner's T3 Code: the Nightly he ran, plus live thread and project feeds for Hea
   not a migration: an older build ignores it.
 - **Thread offload:** `t3 thread offload` moves threads idle for 7+ days, with their subagents
   and forks, out of the database into compressed files under `~/.t3/offload/`; `t3 thread restore`
-  puts one back exactly. Runs inside the running server. See [thread-offload.md](thread-offload.md).
+  puts one back exactly and keeps the bundle (`t3 thread prune-restored` deletes old ones). Runs
+  inside the running server. See [thread-offload.md](thread-offload.md).
 - **Build identity:** versions `<nightly>-fagner.N`, app name `T3 Code (Fagner)`, no update feed
   (the updater reports updates as unavailable, so nothing can replace it with upstream).
 

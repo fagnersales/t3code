@@ -22,12 +22,14 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as Stream from "effect/Stream";
 
 import * as ServerConfig from "../config.ts";
+import { ORCHESTRATION_V2_PROJECTION_SCHEMA_VERSION } from "../orchestration-v2/ProjectionStore.ts";
 import * as ThreadCommandExecutor from "../orchestration-v2/ThreadCommandExecutor.ts";
 import {
   BUNDLE_HEADER,
   BUNDLE_TRAILER,
   type BundleReader,
   fileSize,
+  moveFileDurably,
   openBundleReader,
   openBundleWriter,
   threadKey,
@@ -55,7 +57,7 @@ const fail = (reason: ThreadOffloadError["reason"], detail: string, cause?: unkn
 /**
  * Every table that holds a thread's rows, in the order a restore inserts them: the thread row
  * comes first because the message search trigger reads it. `where` selects one thread's rows
- * with a single `?`. Tables missing from this database's schema are skipped.
+ * with a single `?`. Each must exist with its column, or nothing is offloaded.
  */
 const THREAD_TABLES: ReadonlyArray<{
   readonly table: string;
@@ -121,13 +123,20 @@ const THREAD_TABLES: ReadonlyArray<{
     "projection_thread_messages",
     "projection_thread_sessions",
     "projection_thread_pull_requests",
-    "projection_thread_activities",
-    "projection_thread_proposed_plans",
-    "projection_turns",
-    "projection_pending_approvals",
-    "checkpoint_diff_blobs",
   ].map((table) => ({ table, where: "thread_id = ?", column: "thread_id" })),
 ];
+
+/**
+ * Tables with a thread column that offloading leaves alone on purpose. Any other table with one
+ * stops offloading until it is added here or to `THREAD_TABLES`.
+ */
+const IGNORED_THREAD_TABLES: Readonly<Record<string, string>> = {
+  scheduled_tasks: "a thread a scheduled task targets is kept, so no offloaded thread has a row",
+};
+
+/** Columns that name a thread, by convention: a table with one may hold a thread's rows. */
+const THREAD_COLUMN_FILTER = `p.name IN ('thread_id', 'stream_id', 'aggregate_id')
+  OR p.name GLOB '*_thread_id'`;
 
 interface TableShape {
   readonly table: string;
@@ -136,6 +145,12 @@ interface TableShape {
   /** Set when the primary key is the rowid itself, so the row carries it. */
   readonly rowidAlias: boolean;
   readonly sizeExpression: string;
+}
+
+interface Fingerprint {
+  readonly events: number;
+  readonly sequence: number | null;
+  readonly updatedAt: string | null;
 }
 
 const quote = (identifier: string) => `"${identifier.replaceAll('"', '""')}"`;
@@ -238,9 +253,18 @@ export const selectUnits = (
     .toSorted((left, right) => left.lastActivityAt.localeCompare(right.lastActivityAt));
 };
 
+/** The schema a bundle's rows fit; a restore into any other schema is refused. */
+const BundleSchema = Schema.Struct({
+  /** The database's latest applied migration. */
+  migrationId: Schema.Int,
+  projectionSchemaVersion: Schema.Int,
+});
+type BundleSchema = typeof BundleSchema.Type;
+
 const BundleHeader = Schema.Struct({
   format: Schema.Literal("t3code-thread-offload"),
-  version: Schema.Literal(1),
+  version: Schema.Literal(2),
+  schema: BundleSchema,
   rootThreadId: ThreadId,
   threadIds: Schema.Array(ThreadId),
   titles: Schema.Record(Schema.String, Schema.String),
@@ -249,6 +273,10 @@ const BundleHeader = Schema.Struct({
   tables: Schema.Record(Schema.String, Schema.Array(Schema.String)),
 });
 type BundleHeader = typeof BundleHeader.Type;
+
+const EVENTS_TABLE = "orchestration_events";
+/** How a row line of the event log starts: lines are JSON without spaces. */
+const EVENT_LINE_PREFIX = `["${EVENTS_TABLE}",`;
 
 const BundleTrailer = Schema.Struct({ sha256: Schema.String, lineCount: Schema.Int });
 
@@ -299,9 +327,10 @@ export interface ThreadOffloadShape {
     readonly before: string;
     readonly keepThreadIds: ReadonlySet<string>;
   }) => Effect.Effect<ThreadOffloadResult, ThreadOffloadError>;
-  readonly restore: (input: {
-    readonly threadId: ThreadId;
-  }) => Effect.Effect<ThreadRestoreResult, ThreadOffloadError>;
+  /** By an offloaded thread's record, or by a bundle's absolute path when its records are lost. */
+  readonly restore: (
+    input: { readonly threadId: ThreadId } | { readonly bundlePath: string },
+  ) => Effect.Effect<ThreadRestoreResult, ThreadOffloadError>;
   readonly offloadDirectory: string;
   /**
    * Offloading adds no event, so a client resuming the shell from a cursor at or below this
@@ -316,9 +345,18 @@ export class ThreadOffload extends Context.Service<ThreadOffload, ThreadOffloadS
   "t3/threadOffload/ThreadOffload",
 ) {}
 
+/** Runs after a unit's bundle and records are written, before its rows are deleted; for tests. */
+export class BeforeDelete extends Context.Reference<
+  (threadIds: ReadonlyArray<ThreadId>) => Effect.Effect<void>
+>("t3/threadOffload/BeforeDelete", { defaultValue: () => () => Effect.void }) {}
+
 /** Where the offloaded threads of a T3 home live; the CLI reads records from here directly. */
 export const offloadDirectoryFor = (baseDir: string, path: Path.Path) =>
   path.join(baseDir, "offload");
+
+/** Bundles whose threads were restored. Restore never deletes a bundle; `t3 thread prune-restored` does. */
+export const restoredDirectoryFor = (offloadDirectory: string, path: Path.Path) =>
+  path.join(offloadDirectory, "restored");
 
 const recordPathFor = (offloadDirectory: string, threadId: string, path: Path.Path) =>
   path.join(offloadDirectory, "records", `${threadKey(threadId)}.json`);
@@ -344,6 +382,7 @@ const make = Effect.gen(function* () {
   const offloadDirectory = offloadDirectoryFor(config.baseDir, path);
   const bundleDirectory = path.join(offloadDirectory, "bundles");
   const recordDirectory = path.join(offloadDirectory, "records");
+  const restoredDirectory = restoredDirectoryFor(offloadDirectory, path);
   const resyncPath = path.join(offloadDirectory, "shell-resync-sequence");
   const resyncSequence = yield* Ref.make(
     Number((yield* fs.readFileString(resyncPath).pipe(Effect.orElseSucceed(() => "0"))).trim()) ||
@@ -367,6 +406,21 @@ const make = Effect.gen(function* () {
     });
 
   const describeTables = Effect.gen(function* () {
+    const keyed = yield* read<{ readonly name: string }>(`
+      SELECT DISTINCT m.name FROM sqlite_master AS m, pragma_table_info(m.name) AS p
+      WHERE m.type = 'table' AND (${THREAD_COLUMN_FILTER})
+      ORDER BY m.name
+    `);
+    const handled = new Set(THREAD_TABLES.map((spec) => spec.table));
+    const unknown = keyed
+      .map((row) => row.name)
+      .filter((name) => !handled.has(name) && IGNORED_THREAD_TABLES[name] === undefined);
+    if (unknown.length > 0) {
+      return yield* fail(
+        "failed",
+        `The database has thread rows in ${unknown.join(", ")}, which offloading does not know; nothing was offloaded. Add each to THREAD_TABLES or IGNORED_THREAD_TABLES in threadOffload/ThreadOffload.ts.`,
+      );
+    }
     const shapes: Array<TableShape> = [];
     for (const spec of THREAD_TABLES) {
       const info = yield* read<{
@@ -374,7 +428,12 @@ const make = Effect.gen(function* () {
         readonly type: string;
         readonly pk: number;
       }>(`SELECT name, type, pk FROM pragma_table_info(?)`, [spec.table]);
-      if (!info.some((column) => column.name === spec.column)) continue;
+      if (!info.some((column) => column.name === spec.column)) {
+        return yield* fail(
+          "failed",
+          `${spec.table} has no ${spec.column} column in this database; nothing was offloaded. Update THREAD_TABLES in threadOffload/ThreadOffload.ts.`,
+        );
+      }
       const definition = yield* read<{ readonly rowless: number }>(
         `SELECT sql LIKE '%WITHOUT ROWID%' AS rowless FROM sqlite_master WHERE name = ?`,
         [spec.table],
@@ -412,6 +471,35 @@ const make = Effect.gen(function* () {
       reclaimableBytes: (row?.free ?? 0) * (row?.size ?? 0),
     } satisfies ThreadOffloadStorage;
   });
+
+  const currentSchema = Effect.gen(function* () {
+    const rows = yield* read<{ readonly id: number | null }>(
+      `SELECT MAX(migration_id) AS id FROM effect_sql_migrations`,
+    );
+    return {
+      migrationId: rows[0]?.id ?? 0,
+      projectionSchemaVersion: ORCHESTRATION_V2_PROJECTION_SCHEMA_VERSION,
+    } satisfies BundleSchema;
+  });
+
+  /**
+   * What says a thread changed: some writers (provider sessions, command output, checkpoints,
+   * runs, the session importers) do not take the command lock, so the delete checks this again.
+   */
+  const fingerprintQuery = `
+    SELECT
+      (SELECT COUNT(*) FROM orchestration_events
+        WHERE aggregate_kind = 'thread' AND stream_id = ?1) AS events,
+      (SELECT MAX(sequence) FROM orchestration_events
+        WHERE aggregate_kind = 'thread' AND stream_id = ?1) AS sequence,
+      (SELECT updated_at FROM orchestration_v2_projection_threads
+        WHERE thread_id = ?1) AS updatedAt`;
+  const sameFingerprint = (left: Fingerprint | undefined, right: Fingerprint | undefined) =>
+    left !== undefined &&
+    right !== undefined &&
+    left.events === right.events &&
+    left.sequence === right.sequence &&
+    left.updatedAt === right.updatedAt;
 
   const announceChange = Effect.gen(function* () {
     const rows = yield* sql<{ readonly sequence: number | null }>`
@@ -481,6 +569,15 @@ const make = Effect.gen(function* () {
       UNION SELECT thread_id, 'effects pending' FROM orchestration_v2_effect_outbox
         WHERE status IN ('pending', 'running')
       UNION SELECT thread_id, 'scheduled task' FROM scheduled_tasks WHERE thread_id IS NOT NULL
+      UNION SELECT source_thread_id, 'context transfer pending'
+        FROM orchestration_v2_projection_context_transfers WHERE status = 'pending'
+      UNION SELECT target_thread_id, 'context transfer pending'
+        FROM orchestration_v2_projection_context_transfers WHERE status = 'pending'
+      UNION SELECT thread_id, 'imported session' FROM orchestration_v2_projection_threads
+        WHERE thread_id LIKE 'import:%'
+      UNION SELECT thread_id, 'imported session' FROM provider_session_runtime
+        WHERE json_valid(runtime_payload_json)
+          AND json_type(runtime_payload_json, '$.importedTranscripts') IS NOT NULL
     `);
     const latestSequence = Math.max(0, ...lastEvents.map((event) => event.sequence));
     const lastByThread = new Map(lastEvents.map((event) => [event.stream_id, event]));
@@ -593,6 +690,8 @@ const make = Effect.gen(function* () {
     );
     /** Exported rowids per thread and table, which the delete must match exactly. */
     const exported = new Map<string, Map<string, Array<number>>>();
+    /** Each thread as its rows started being exported, which the delete must still find. */
+    const fingerprints = new Map<string, Fingerprint>();
     let rowCount = 0;
     let rowBytes = 0;
     const exportRows = Effect.gen(function* () {
@@ -602,6 +701,8 @@ const make = Effect.gen(function* () {
       for (const threadId of input.header.threadIds) {
         const byTable = new Map<string, Array<number>>();
         exported.set(threadId, byTable);
+        const fingerprint = yield* read<Fingerprint>(fingerprintQuery, [threadId]);
+        fingerprints.set(threadId, fingerprint[0]!);
         for (const shape of input.shapes) {
           const ids = yield* read<{ readonly r: number; readonly b: number }>(
             `SELECT rowid AS r, ${shape.sizeExpression} AS b FROM ${quote(shape.table)}
@@ -660,18 +761,27 @@ const make = Effect.gen(function* () {
       Effect.onError(() => Effect.promise(() => writer.abort()).pipe(Effect.ignore({ log: true }))),
     );
     const summary = yield* exportRows;
-    return { summary, exported, rowCount, rowBytes };
+    return { summary, exported, fingerprints, rowCount, rowBytes };
   });
 
-  /** Reads the bundle back and checks every line against the trailer and the expected hash. */
+  /**
+   * Reads the bundle back and checks every line against the trailer and the expected hash. With
+   * `collectEvents`, also returns the `event_id` of each thread's events in the bundle.
+   */
   const verifyBundle = Effect.fn("ThreadOffload.verifyBundle")(function* (
     bundlePath: string,
-    expected?: { readonly sha256: string; readonly lineCount: number },
+    options: {
+      readonly expected?: { readonly sha256: string; readonly lineCount: number };
+      readonly collectEvents?: boolean;
+    } = {},
   ) {
+    const expected = options.expected;
     const reader = openBundleReader(bundlePath);
     return yield* Effect.gen(function* () {
       let header: BundleHeader | undefined;
       let trailer: typeof BundleTrailer.Type | undefined;
+      let eventIdIndex = -1;
+      const events = new Map<string, Array<string>>();
       while (true) {
         const line = yield* promise("Could not read the bundle", () => reader.next());
         if (line === undefined) break;
@@ -686,6 +796,22 @@ const make = Effect.gen(function* () {
             return yield* fail("failed", "The bundle has no header.");
           }
           header = first[1];
+          eventIdIndex = header.tables[EVENTS_TABLE]?.indexOf("event_id") ?? -1;
+          if (options.collectEvents === true && eventIdIndex === -1) {
+            return yield* fail("failed", "The bundle has no event ids.");
+          }
+          continue;
+        }
+        if (options.collectEvents === true && line.startsWith(EVENT_LINE_PREFIX)) {
+          const row = yield* Effect.try({
+            try: () => decodeLine(line),
+            catch: (cause) => fail("failed", "A bundle line is unreadable.", cause),
+          });
+          if (row.length === 4) {
+            const ids = events.get(row[1]) ?? [];
+            ids.push(String(row[3][eventIdIndex]));
+            events.set(row[1], ids);
+          }
           continue;
         }
         if (line.startsWith(`["${BUNDLE_TRAILER}"`)) {
@@ -709,7 +835,7 @@ const make = Effect.gen(function* () {
       ) {
         return yield* fail("failed", `${bundlePath} differs from what was written.`);
       }
-      return header;
+      return { header, events };
     }).pipe(Effect.ensuring(Effect.sync(() => reader.close())));
   });
 
@@ -717,8 +843,16 @@ const make = Effect.gen(function* () {
     readonly threadId: ThreadId;
     readonly shapes: ReadonlyArray<TableShape>;
     readonly rowids: ReadonlyMap<string, ReadonlyArray<number>>;
+    readonly fingerprint: Fingerprint | undefined;
   }) {
     yield* Effect.gen(function* () {
+      const now = yield* sql.unsafe<Fingerprint>(fingerprintQuery, [input.threadId]);
+      if (!sameFingerprint(input.fingerprint, now[0])) {
+        return yield* fail(
+          "conflict",
+          `${input.threadId} changed while being offloaded; nothing of it was removed.`,
+        );
+      }
       const latest = yield* sql<{ readonly sequence: number | null }>`
         SELECT MAX(sequence) AS sequence FROM orchestration_events
         WHERE application_event_version = 2 AND aggregate_kind = 'thread'
@@ -755,6 +889,22 @@ const make = Effect.gen(function* () {
         }
       }
     }).pipe(sql.withTransaction);
+  });
+
+  /**
+   * After a failed delete: threads still in the database lose their records, so nothing says they
+   * are offloaded. The bundle goes too when no thread was removed, as the database holds it all.
+   */
+  const forgetLiveThreads = Effect.fn("ThreadOffload.forgetLiveThreads")(function* (input: {
+    readonly threadIds: ReadonlyArray<ThreadId>;
+    readonly removed: ReadonlyArray<ThreadId>;
+    readonly bundlePath: string;
+  }) {
+    for (const threadId of input.threadIds) {
+      if (input.removed.includes(threadId)) continue;
+      yield* fs.remove(recordPathFor(offloadDirectory, threadId, path), { force: true });
+    }
+    if (input.removed.length === 0) yield* fs.remove(input.bundlePath, { force: true });
   });
 
   const offload: ThreadOffloadShape["offload"] = Effect.fn("ThreadOffload.offload")(
@@ -797,7 +947,8 @@ const make = Effect.gen(function* () {
           const thread = (threadId: ThreadId) => candidates.threads.get(threadId)!;
           const header: BundleHeader = {
             format: "t3code-thread-offload",
-            version: 1,
+            version: 2,
+            schema: yield* currentSchema,
             rootThreadId: input.threadId,
             threadIds,
             titles: Object.fromEntries(threadIds.map((id) => [id, thread(id).title])),
@@ -808,7 +959,7 @@ const make = Effect.gen(function* () {
             tables: Object.fromEntries(shapes.map((shape) => [shape.table, shape.columns])),
           };
           const written = yield* writeBundle({ bundlePath, header, shapes });
-          yield* verifyBundle(bundlePath, written.summary).pipe(
+          yield* verifyBundle(bundlePath, { expected: written.summary }).pipe(
             Effect.tapError(() => fs.remove(bundlePath, { force: true }).pipe(Effect.ignore)),
           );
           // Records first: a thread removed before a crash still says where it went.
@@ -827,13 +978,24 @@ const make = Effect.gen(function* () {
               ),
             );
           }
+          yield* (yield* BeforeDelete)(threadIds);
           // Children before parents, so no remaining thread reads one already removed.
+          const removed: Array<ThreadId> = [];
           for (const threadId of threadIds.toReversed()) {
             yield* deleteThreadRows({
               threadId,
               shapes,
               rowids: written.exported.get(threadId) ?? new Map(),
-            }).pipe(Effect.onError(() => announceChange.pipe(Effect.ignore)));
+              fingerprint: written.fingerprints.get(threadId),
+            }).pipe(
+              Effect.onError(() =>
+                forgetLiveThreads({ threadIds, removed, bundlePath }).pipe(
+                  Effect.andThen(announceChange),
+                  Effect.ignore({ log: true }),
+                ),
+              ),
+            );
+            removed.push(threadId);
           }
           yield* announceChange;
           return {
@@ -855,15 +1017,61 @@ const make = Effect.gen(function* () {
     ),
   );
 
-  const threadExists = (threadId: ThreadId) =>
-    sql<{ readonly n: number }>`
-      SELECT
-        EXISTS (SELECT 1 FROM orchestration_v2_projection_threads WHERE thread_id = ${threadId})
-        OR EXISTS (
-          SELECT 1 FROM orchestration_events
-          WHERE aggregate_kind = 'thread' AND stream_id = ${threadId}
-        ) AS n
-    `.pipe(Effect.map((rows) => rows[0]?.n === 1));
+  /** Tables of this database that hold rows of the thread, by the bundle's own table list. */
+  const tablesHolding = Effect.fn("ThreadOffload.tablesHolding")(function* (
+    header: BundleHeader,
+    threadId: ThreadId,
+  ) {
+    const holding: Array<string> = [];
+    for (const spec of THREAD_TABLES) {
+      if (header.tables[spec.table] === undefined) continue;
+      const rows = yield* sql.unsafe<{ readonly n: number }>(
+        `SELECT EXISTS (SELECT 1 FROM ${quote(spec.table)} WHERE ${spec.where}) AS n`,
+        [threadId],
+      );
+      if (rows[0]?.n === 1) holding.push(spec.table);
+    }
+    return holding;
+  });
+
+  /**
+   * Whether a thread of the bundle goes back in. One the database has with exactly the bundle's
+   * events was never removed (an offload that stopped partway) and is left alone. One it has in
+   * any other shape was recreated or changed since: restoring would lose one of the two, so
+   * nothing is restored.
+   */
+  const restoreState = Effect.fn("ThreadOffload.restoreState")(function* (input: {
+    readonly header: BundleHeader;
+    readonly threadId: ThreadId;
+    readonly bundleEventIds: ReadonlyArray<string>;
+    readonly bundlePath: string;
+  }) {
+    const live = yield* sql<{ readonly id: string }>`
+      SELECT event_id AS id FROM orchestration_events
+      WHERE aggregate_kind = 'thread' AND stream_id = ${input.threadId}
+    `;
+    if (live.length === 0) {
+      const holding = yield* tablesHolding(input.header, input.threadId);
+      if (holding.length === 0) return "missing" as const;
+      return yield* fail(
+        "conflict",
+        `${input.threadId} has no events but still has rows in ${holding.join(", ")}. Nothing was restored; the bundle stays at ${input.bundlePath}.`,
+      );
+    }
+    const liveIds = new Set(live.map((row) => row.id));
+    const common = input.bundleEventIds.filter((id) => liveIds.has(id)).length;
+    if (
+      live.length === input.bundleEventIds.length &&
+      common === input.bundleEventIds.length &&
+      liveIds.size === live.length
+    ) {
+      return "present" as const;
+    }
+    return yield* fail(
+      "conflict",
+      `${input.threadId} exists again with ${live.length} event(s); the bundle holds ${input.bundleEventIds.length}, ${common} of them the same. It was recreated or changed after it was offloaded, so nothing was restored and the bundle stays at ${input.bundlePath}.`,
+    );
+  });
 
   const insertRows = Effect.fn("ThreadOffload.insertRows")(function* (input: {
     readonly reader: BundleReader;
@@ -888,7 +1096,10 @@ const make = Effect.gen(function* () {
           return yield* fail("failed", `The bundle's ${table} rows do not match its header.`);
         }
         const names = [...(rowid === null ? [] : ["rowid"]), ...columns].map(quote).join(", ");
-        // A rowid another row took since is left to SQLite; order within a thread is kept.
+        // Rows go back under their old rowids. One another row took since becomes NULL, and SQLite
+        // gives the row one past the table's largest, so it then sorts after rows written after
+        // the offload, its columns unchanged. A table whose key is the rowid (the event log's
+        // `sequence`) carries it among the columns: a taken one fails the insert instead.
         const rowidValue =
           rowid === null
             ? []
@@ -911,15 +1122,50 @@ const make = Effect.gen(function* () {
 
   const restore: ThreadOffloadShape["restore"] = Effect.fn("ThreadOffload.restore")(
     function* (input) {
-      const record = yield* recordOf(input.threadId);
-      if (Option.isNone(record)) {
-        return yield* fail("not-found", `${input.threadId} is not offloaded here.`);
+      let bundlePath: string;
+      if ("threadId" in input) {
+        const record = yield* recordOf(input.threadId);
+        if (Option.isNone(record)) {
+          return yield* fail("not-found", `${input.threadId} is not offloaded here.`);
+        }
+        bundlePath = path.join(offloadDirectory, record.value.bundle);
+      } else {
+        if (!path.isAbsolute(input.bundlePath)) {
+          return yield* fail("not-found", `${input.bundlePath} is not an absolute path.`);
+        }
+        bundlePath = input.bundlePath;
       }
-      const bundlePath = path.join(offloadDirectory, record.value.bundle);
-      const header = yield* verifyBundle(bundlePath);
+      if (!(yield* fs.exists(bundlePath).pipe(Effect.orElseSucceed(() => false)))) {
+        return yield* fail("not-found", `The bundle ${bundlePath} is missing.`);
+      }
+      const { header, events } = yield* verifyBundle(bundlePath, { collectEvents: true });
+      if ("threadId" in input && !header.threadIds.includes(input.threadId)) {
+        return yield* fail("not-found", `${bundlePath} does not hold ${input.threadId}.`);
+      }
+      const schema = yield* currentSchema;
+      if (
+        header.schema.migrationId !== schema.migrationId ||
+        header.schema.projectionSchemaVersion !== schema.projectionSchemaVersion
+      ) {
+        return yield* fail(
+          "conflict",
+          `${bundlePath} was written by a database at migration ${header.schema.migrationId} with projection schema ${header.schema.projectionSchemaVersion}; this one is at migration ${schema.migrationId} with projection schema ${schema.projectionSchemaVersion}. Its rows may not fit, so nothing was restored. Restore it with the T3 Code version that wrote it.`,
+        );
+      }
       return yield* withThreadLocks(
         header.threadIds,
         Effect.gen(function* () {
+          // Every thread is checked before any goes back, so a conflict changes nothing.
+          const missing = new Set<ThreadId>();
+          for (const threadId of header.threadIds) {
+            const state = yield* restoreState({
+              header,
+              threadId,
+              bundleEventIds: events.get(threadId) ?? [],
+              bundlePath,
+            });
+            if (state === "missing") missing.add(threadId);
+          }
           const reader = openBundleReader(bundlePath);
           const restored: Array<ThreadId> = [];
           let rowCount = 0;
@@ -927,13 +1173,16 @@ const make = Effect.gen(function* () {
             yield* promise("Could not read the bundle", () => reader.next());
             let line = yield* promise("Could not read the bundle", () => reader.next());
             for (const threadId of header.threadIds) {
-              const insert = !(yield* threadExists(threadId));
-              const result = yield* insertRows({
-                reader,
-                header,
-                threadId,
-                insert,
-                first: line,
+              const insert = missing.has(threadId);
+              const result = yield* Effect.gen(function* () {
+                // Writers that skip the command lock may have recreated it since the check.
+                if (insert && (yield* tablesHolding(header, threadId)).length > 0) {
+                  return yield* fail(
+                    "conflict",
+                    `${threadId} was recreated while being restored; the bundle stays at ${bundlePath}.`,
+                  );
+                }
+                return yield* insertRows({ reader, header, threadId, insert, first: line });
               }).pipe(insert ? sql.withTransaction : (effect) => effect);
               line = result.next;
               rowCount += result.inserted;
@@ -943,14 +1192,38 @@ const make = Effect.gen(function* () {
             Effect.onError(() => announceChange.pipe(Effect.ignore)),
             Effect.ensuring(Effect.sync(() => reader.close())),
           );
+          // The bundle is kept: a bundle offloading wrote moves to restored/, others stay put.
+          // A failed move leaves it where it was, which a later restore also accepts.
+          const movedAtSeconds = DateTime.toEpochMillis(yield* DateTime.now) / 1000;
+          const keptPath =
+            path.dirname(bundlePath) === bundleDirectory
+              ? yield* promise("Could not move the restored bundle", () =>
+                  moveFileDurably(
+                    bundlePath,
+                    path.join(restoredDirectory, path.basename(bundlePath)),
+                    movedAtSeconds,
+                  ),
+                ).pipe(
+                  Effect.as(path.join(restoredDirectory, path.basename(bundlePath))),
+                  Effect.tapError((error) => Effect.logWarning(error.detail)),
+                  Effect.orElseSucceed(() => bundlePath),
+                )
+              : bundlePath;
+          const relativeBundle = path.relative(offloadDirectory, bundlePath);
           for (const threadId of header.threadIds) {
+            const record = yield* recordOf(threadId);
+            if (Option.isNone(record) || record.value.bundle !== relativeBundle) continue;
             yield* fs
               .remove(recordPathFor(offloadDirectory, threadId, path), { force: true })
               .pipe(Effect.ignore({ log: true }));
           }
-          yield* fs.remove(bundlePath, { force: true }).pipe(Effect.ignore({ log: true }));
           yield* announceChange;
-          return { rootThreadId: header.rootThreadId, threadIds: restored, rowCount };
+          return {
+            rootThreadId: header.rootThreadId,
+            threadIds: restored,
+            rowCount,
+            bundlePath: keptPath,
+          } satisfies ThreadRestoreResult;
         }),
       );
     },
@@ -969,6 +1242,8 @@ const make = Effect.gen(function* () {
   });
 });
 
-export const layer = Layer.effect(ThreadOffload, make).pipe(
-  Layer.provide(ThreadCommandExecutor.layer),
-);
+/**
+ * Needs the orchestrator's own `ThreadCommandExecutor`, not one of its own: a second lock would
+ * not keep commands out while a thread is offloaded or restored.
+ */
+export const layer = Layer.effect(ThreadOffload, make);

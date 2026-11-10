@@ -29,7 +29,11 @@ import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http";
 import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
 import * as ServerConfig from "../config.ts";
 import { readPersistedServerRuntimeState } from "../serverRuntimeState.ts";
-import { offloadDirectoryFor, readRecord } from "../threadOffload/ThreadOffload.ts";
+import {
+  offloadDirectoryFor,
+  readRecord,
+  restoredDirectoryFor,
+} from "../threadOffload/ThreadOffload.ts";
 import { projectLocationFlags, resolveCliAuthConfig } from "./config.ts";
 
 export class ThreadOffloadCliError extends Schema.TaggedError<ThreadOffloadCliError>()(
@@ -301,14 +305,31 @@ const restoreCommand = Command.make("restore", {
     ),
     Argument.optional,
   ),
+  bundle: Flag.String("bundle").pipe(
+    Flag.withDescription(
+      "Restore from this bundle file instead of a thread's record, for when the record is lost.",
+    ),
+    Flag.optional,
+  ),
   json: Flag.Boolean("json").pipe(
     Flag.withDescription("Print JSON instead of text."),
     Flag.withDefault(false),
   ),
 }).pipe(
-  Command.withDescription("Put an offloaded thread back exactly as it was, or list them."),
+  Command.withDescription(
+    "Put an offloaded thread back exactly as it was, or list them. The bundle is kept under offload/restored until t3 thread prune-restored.",
+  ),
   Command.withHandler((flags) =>
     Effect.gen(function* () {
+      if (Option.isSome(flags.bundle)) {
+        const path = yield* Path.Path;
+        const bundlePath = path.resolve(flags.bundle.value);
+        return yield* withServer(flags, "t3 thread restore", (call) =>
+          call(THREAD_RESTORE_ROUTE, { bundlePath }, ThreadRestoreResult).pipe(
+            Effect.flatMap((result) => printRestored(result, flags.json)),
+          ),
+        );
+      }
       if (Option.isNone(flags.thread)) {
         const logLevel = yield* GlobalFlag.LogLevel;
         const config = yield* resolveCliAuthConfig(flags, logLevel);
@@ -328,13 +349,69 @@ const restoreCommand = Command.make("restore", {
         ),
       );
       yield* withServer(flags, "t3 thread restore", (call) =>
-        Effect.gen(function* () {
-          const result = yield* call(THREAD_RESTORE_ROUTE, { threadId }, ThreadRestoreResult);
-          if (flags.json) return yield* Console.log(encodeJson(result));
-          yield* Console.log(
-            `Restored ${result.threadIds.length} thread(s) (${result.rowCount} rows).`,
-          );
-        }),
+        call(THREAD_RESTORE_ROUTE, { threadId }, ThreadRestoreResult).pipe(
+          Effect.flatMap((result) => printRestored(result, flags.json)),
+        ),
+      );
+    }),
+  ),
+);
+
+const printRestored = (result: ThreadRestoreResult, json: boolean) =>
+  json
+    ? Console.log(encodeJson(result))
+    : Console.log(
+        `Restored ${result.threadIds.length} thread(s) (${result.rowCount} rows). The bundle stays at ${result.bundlePath}.`,
+      );
+
+const pruneRestoredCommand = Command.make("prune-restored", {
+  ...projectLocationFlags,
+  olderThanDays: Flag.Int("older-than-days").pipe(
+    Flag.withDescription("Delete bundles restored at least this many days ago."),
+    Flag.withDefault(30),
+  ),
+  dryRun: Flag.Boolean("dry-run").pipe(
+    Flag.withDescription("List what would be deleted, deleting nothing."),
+    Flag.withDefault(false),
+  ),
+}).pipe(
+  Command.withDescription(
+    "Delete bundles under the offload folder's restored/ whose threads were restored long ago. Restore itself never deletes a bundle.",
+  ),
+  Command.withHandler((flags) =>
+    Effect.gen(function* () {
+      const logLevel = yield* GlobalFlag.LogLevel;
+      const config = yield* resolveCliAuthConfig(flags, logLevel);
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = restoredDirectoryFor(offloadDirectoryFor(config.baseDir, path), path);
+      const names = yield* fs.readDirectory(directory).pipe(Effect.orElseSucceed(() => []));
+      const cutoff =
+        DateTime.toEpochMillis(yield* DateTime.now) -
+        Duration.toMillis(Duration.days(Math.max(0, flags.olderThanDays)));
+      let count = 0;
+      let bytes = 0;
+      for (const name of names.filter((entry) => entry.endsWith(".jsonl.zst"))) {
+        const file = path.join(directory, name);
+        const info = yield* fs.stat(file).pipe(Effect.option);
+        if (Option.isNone(info)) continue;
+        const modified = Option.getOrUndefined(info.value.mtime)?.getTime();
+        if (modified === undefined || modified > cutoff) continue;
+        if (!flags.dryRun) {
+          yield* fs
+            .remove(file)
+            .pipe(
+              Effect.mapError(
+                () => new ThreadOffloadCliError({ detail: `Could not delete ${file}.` }),
+              ),
+            );
+        }
+        count += 1;
+        bytes += Number(info.value.size);
+        yield* Console.log(`${flags.dryRun ? "Would delete" : "Deleted"} ${file}`);
+      }
+      yield* Console.log(
+        `${flags.dryRun ? "Would delete" : "Deleted"} ${count} restored bundle(s), ${formatBytes(bytes)}.`,
       );
     }),
   ),
@@ -356,3 +433,4 @@ export const offloadNotice = Effect.fn("cli.thread.offloadNotice")(function* (
 
 export const threadOffloadCommand = offloadCommand;
 export const threadRestoreCommand = restoreCommand;
+export const threadPruneRestoredCommand = pruneRestoredCommand;

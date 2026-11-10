@@ -1,6 +1,7 @@
-// @effect-diagnostics nodeBuiltinImport:off - zstd with a long window and streaming hashes are only in node:zlib and node:crypto.
+// @effect-diagnostics nodeBuiltinImport:off - zstd with a long window, streaming hashes and fsync of a folder are only in node:zlib, node:crypto and node:fs.
 import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
+import * as NodePath from "node:path";
 import * as NodeStream from "node:stream";
 import * as NodeZlib from "node:zlib";
 
@@ -17,7 +18,7 @@ export const BUNDLE_TRAILER = "$end";
 
 export interface BundleWriter {
   readonly writeLine: (line: string) => Promise<void>;
-  /** Writes the trailer, flushes the file to disk and moves it to its final path. */
+  /** Writes the trailer, flushes the file to disk, moves it to its final path and syncs its folder. */
   readonly finish: (trailer: (summary: BundleSummary) => string) => Promise<BundleSummary>;
   readonly abort: () => Promise<void>;
 }
@@ -66,13 +67,9 @@ export const openBundleWriter = async (path: string): Promise<BundleWriter> => {
       await push(trailer(summary));
       zstd.end();
       await done;
-      const handle = await NodeFS.promises.open(partialPath, "r+");
-      try {
-        await handle.sync();
-      } finally {
-        await handle.close();
-      }
+      await syncFile(partialPath);
       await NodeFS.promises.rename(partialPath, path);
+      await syncDirectory(NodePath.dirname(path));
       return summary;
     },
     abort: async () => {
@@ -156,8 +153,53 @@ export const fileSize = async (path: string) => (await NodeFS.promises.stat(path
 export const threadKey = (threadId: string) =>
   NodeCrypto.createHash("sha256").update(threadId).digest("hex").slice(0, 32);
 
+/**
+ * Node's fsync is `fcntl(F_FULLFSYNC)` on macOS (libuv falls back to `F_BARRIERFSYNC`, then plain
+ * `fsync`), so a synced file is on the disk itself, not only in its write cache.
+ */
+const syncFile = async (path: string) => {
+  const handle = await NodeFS.promises.open(path, "r+");
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+};
+
+/** Codes for opening a folder as a file on Windows, which has nothing to sync there. */
+const FOLDER_OPEN_UNSUPPORTED = new Set(["EISDIR", "EPERM"]);
+
+/** Makes a rename into or out of the folder survive a crash. */
+const syncDirectory = async (path: string) => {
+  const handle = await NodeFS.promises.open(path, "r").catch((cause: unknown) => {
+    const code = (cause as NodeJS.ErrnoException | undefined)?.code;
+    if (code !== undefined && FOLDER_OPEN_UNSUPPORTED.has(code)) return undefined;
+    throw cause;
+  });
+  if (handle === undefined) return;
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+};
+
 export const writeFileAtomically = async (path: string, text: string) => {
   const partialPath = `${path}.partial`;
   await NodeFS.promises.writeFile(partialPath, text);
+  await syncFile(partialPath);
   await NodeFS.promises.rename(partialPath, path);
+  await syncDirectory(NodePath.dirname(path));
+};
+
+/**
+ * Moves a file within one disk, durably: its new folder and its old one are synced. Its modified
+ * time becomes `movedAtSeconds`, so its age is counted from the move.
+ */
+export const moveFileDurably = async (from: string, to: string, movedAtSeconds: number) => {
+  await NodeFS.promises.mkdir(NodePath.dirname(to), { recursive: true });
+  await NodeFS.promises.rename(from, to);
+  await NodeFS.promises.utimes(to, movedAtSeconds, movedAtSeconds);
+  await syncDirectory(NodePath.dirname(to));
+  await syncDirectory(NodePath.dirname(from));
 };

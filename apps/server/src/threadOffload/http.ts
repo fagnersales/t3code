@@ -41,16 +41,24 @@ const refusal = Effect.fn("ThreadOffloadHttp.refusal")(function* (scope: AuthEnv
   return Option.none();
 });
 
-/** Threads another app follows through a thread group stay, like pinned ones. */
-const groupedThreadIds = Effect.gen(function* () {
+/**
+ * Threads another app follows through a thread group stay, like pinned ones. Unreadable settings
+ * stop the run: without them every grouped thread would look free to offload.
+ */
+export const groupedThreadIds = Effect.gen(function* () {
   const settings = yield* ServerSettings.ServerSettingsService;
-  const current = yield* settings.getSettings.pipe(Effect.option);
-  return new Set<string>(
-    Option.match(current, {
-      onNone: () => [],
-      onSome: (value) => Object.values(value.threadGroups).flat(),
-    }),
+  const current = yield* settings.getSettings.pipe(
+    Effect.mapError(
+      (cause) =>
+        new ThreadOffload.ThreadOffloadError({
+          reason: "failed",
+          detail:
+            "Could not read the settings, so thread groups are unknown; nothing was offloaded.",
+          cause,
+        }),
+    ),
   );
+  return new Set<string>(Object.values(current.threadGroups).flat());
 });
 
 const HEARTBEAT_INTERVAL = Duration.seconds(15);
@@ -64,7 +72,7 @@ const route = <I, O>(input: {
   readonly usage: string;
   readonly run: (
     request: I,
-    keepThreadIds: ReadonlySet<string>,
+    keepThreadIds: Effect.Effect<ReadonlySet<string>, ThreadOffload.ThreadOffloadError>,
   ) => Effect.Effect<O, ThreadOffload.ThreadOffloadError>;
 }) => {
   const decode = Schema.decodeUnknownOption(input.request);
@@ -75,8 +83,11 @@ const route = <I, O>(input: {
     const request = yield* HttpServerRequest.HttpServerRequest;
     const body = Option.flatMap(yield* request.json.pipe(Effect.option), decode);
     if (Option.isNone(body)) return problem(400, input.usage);
-    const keepThreadIds = yield* groupedThreadIds;
+    const settings = yield* ServerSettings.ServerSettingsService;
     // A client that leaves early does not stop the work halfway; the next run sees its outcome.
+    const keepThreadIds = groupedThreadIds.pipe(
+      Effect.provideService(ServerSettings.ServerSettingsService, settings),
+    );
     const outcome = input.run(body.value, keepThreadIds).pipe(
       Effect.map((result): ThreadOffloadResponseLine => ({
         type: "result",
@@ -118,7 +129,8 @@ export const layer = Layer.unwrap(
           request: ThreadOffloadPlanRequest,
           response: ThreadOffloadPlan,
           usage: "Send { before, withSizes, limit?, threadIds? }.",
-          run: (request, keepThreadIds) => offload.plan({ ...request, keepThreadIds }),
+          run: (request, groups) =>
+            Effect.flatMap(groups, (keepThreadIds) => offload.plan({ ...request, keepThreadIds })),
         }),
       ),
       HttpRouter.add(
@@ -129,7 +141,10 @@ export const layer = Layer.unwrap(
           request: ThreadOffloadRequest,
           response: ThreadOffloadResult,
           usage: "Send { threadId, before }.",
-          run: (request, keepThreadIds) => offload.offload({ ...request, keepThreadIds }),
+          run: (request, groups) =>
+            Effect.flatMap(groups, (keepThreadIds) =>
+              offload.offload({ ...request, keepThreadIds }),
+            ),
         }),
       ),
       HttpRouter.add(
@@ -139,7 +154,7 @@ export const layer = Layer.unwrap(
           scope: AuthEnvironmentMaintainScope,
           request: ThreadRestoreRequest,
           response: ThreadRestoreResult,
-          usage: "Send { threadId }.",
+          usage: "Send { threadId } or { bundlePath }.",
           run: (request) => offload.restore(request),
         }),
       ),

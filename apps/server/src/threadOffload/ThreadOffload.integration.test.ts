@@ -8,6 +8,7 @@ import {
   EventId,
   ProviderDriverKind,
   ProviderThreadId,
+  ServerSettingsError,
   ThreadId,
   type OrchestrationV2AppThread,
   type OrchestrationV2DomainEvent,
@@ -21,6 +22,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Random from "effect/Random";
 import * as SqlClient from "effect/sql/SqlClient";
 import { TestClock } from "effect/testing";
@@ -42,7 +44,11 @@ import {
   readReplayFixtureTranscript,
 } from "../orchestration-v2/testkit/ProviderReplayFixtures.ts";
 import { materializeReplayTranscriptRuntimeInstructions } from "../orchestration-v2/testkit/ReplayRuntimeInstructions.ts";
+import * as ThreadCommandExecutor from "../orchestration-v2/ThreadCommandExecutor.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
+import * as ServerSettings from "../serverSettings.ts";
+import { threadKey } from "./bundle.ts";
+import * as ThreadOffloadHttp from "./http.ts";
 import * as ThreadOffload from "./ThreadOffload.ts";
 
 /** About the size of a screenshot a review subagent reads, as base64 text. */
@@ -268,6 +274,7 @@ const assertProjectionsMatchRebuild = Effect.fn("assertProjectionsMatchRebuild")
 
 const layerFor = (dbPath: string) =>
   ThreadOffload.layer.pipe(
+    Layer.provideMerge(ThreadCommandExecutor.layer),
     Layer.provideMerge(
       ProjectionMaintenance.layer.pipe(
         Layer.provide(Layer.merge(EventStore.layer, ProjectionStore.layer)),
@@ -419,7 +426,13 @@ describe("ThreadOffload", () => {
           assert.deepEqual(restored.threadIds, [child.id]);
           assert.strictEqual(restored.rowCount, alone.rowCount);
           assert.deepEqual(differingTables(yield* snapshot({ withRowids: true }), original), []);
+          // The bundle is kept, out of the way.
           assert.isFalse(yield* fs.exists(alone.bundlePath));
+          assert.isTrue(yield* fs.exists(restored.bundlePath));
+          assert.strictEqual(
+            restored.bundlePath,
+            `${offload.offloadDirectory}/restored/${alone.bundlePath.split("/").at(-1)}`,
+          );
 
           // An app-owned child with a grandchild: the unit takes the grandchild too.
           const codexChild = codexThreads.find(
@@ -475,5 +488,204 @@ describe("ThreadOffload", () => {
           ),
         ),
       ),
+  );
+
+  it.effect("refuses whatever could lose a thread or misplace its rows, changing nothing", () =>
+    Effect.gen(function* () {
+      const config = yield* ServerConfig.ServerConfig;
+      const threads = yield* seedFixture({
+        dbPath: config.dbPath,
+        fixtureName: "subagent",
+        driver: "claudeAgent",
+        harness: ClaudeOrchestratorReplayHarness,
+        randomSeed: 1,
+      });
+      const parent = threads.find((thread) => thread.lineage.parentThreadId === null)!;
+      const child = threads.find((thread) => thread.lineage.parentThreadId === parent.id)!;
+      yield* writeCrossThreadEvents(parent, child).pipe(
+        Effect.provide(
+          EventSink.layer.pipe(
+            Layer.provide(Layer.merge(EventStore.layer, ProjectionStore.layer)),
+            Layer.provide(NodeSqliteClient.layer({ filename: config.dbPath })),
+          ),
+        ),
+      );
+      yield* seedFixture({
+        dbPath: config.dbPath,
+        fixtureName: "simple",
+        driver: "claudeAgent",
+        harness: ClaudeOrchestratorReplayHarness,
+        randomSeed: 3,
+      });
+
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const offload = yield* ThreadOffload.ThreadOffload;
+        const fs = yield* FileSystem.FileSystem;
+        const keepThreadIds = new Set<string>();
+        const offloadChild = offload.offload({
+          threadId: child.id,
+          before: EVERYTHING_IDLE,
+          keepThreadIds,
+        });
+        const original = yield* snapshot({ withRowids: true });
+        const assertUnchanged = Effect.gen(function* () {
+          assert.deepEqual(differingTables(yield* snapshot({ withRowids: true }), original), []);
+        });
+        const bundles = fs
+          .readDirectory(`${offload.offloadDirectory}/bundles`)
+          .pipe(Effect.orElseSucceed(() => []));
+
+        // Unreadable settings: thread groups are unknown, so nothing may go.
+        const settingsFailure = yield* ThreadOffloadHttp.groupedThreadIds.pipe(
+          Effect.provide(
+            Layer.mock(ServerSettings.ServerSettingsService)({
+              getSettings: Effect.fail(
+                new ServerSettingsError({ settingsPath: "settings.json", operation: "read-file" }),
+              ),
+            }),
+          ),
+          Effect.flip,
+        );
+        assert.strictEqual(settingsFailure.reason, "failed");
+
+        // A pending transfer keeps both threads: the child as its target (spawn), then as its
+        // source (result, which the parent's next message would need).
+        for (const transferId of ["transfer:offload:spawn", "transfer:offload:result"]) {
+          yield* sql`
+            UPDATE orchestration_v2_projection_context_transfers
+            SET status = 'pending' WHERE context_transfer_id = ${transferId}
+          `;
+          const pending = yield* offloadChild.pipe(Effect.flip);
+          assert.strictEqual(pending.reason, "busy");
+          assert.include(pending.detail, "context transfer pending");
+          yield* sql`
+            UPDATE orchestration_v2_projection_context_transfers
+            SET status = 'consumed' WHERE context_transfer_id = ${transferId}
+          `;
+        }
+        yield* assertUnchanged;
+
+        // An imported session's runtime row is how the importer knows it is imported.
+        yield* sql`
+          INSERT INTO provider_session_runtime
+            (thread_id, provider_name, adapter_key, status, last_seen_at, runtime_payload_json)
+          VALUES (${child.id}, 'claudeAgent', 'claudeAgent', 'stopped', '2026-01-01T00:00:00.000Z',
+            '{"importedTranscripts":[]}')
+        `;
+        const imported = yield* offloadChild.pipe(Effect.flip);
+        assert.include(imported.detail, "imported session");
+        yield* sql`DELETE FROM provider_session_runtime WHERE thread_id = ${child.id}`;
+
+        // A table with thread rows that offloading does not know.
+        yield* sql`CREATE TABLE offload_probe (owner_thread_id TEXT)`;
+        const unknownTable = yield* offloadChild.pipe(Effect.flip);
+        assert.strictEqual(unknownTable.reason, "failed");
+        assert.include(unknownTable.detail, "offload_probe");
+        yield* sql`DROP TABLE offload_probe`;
+        yield* assertUnchanged;
+
+        // A write between the export and the delete that keeps every row count.
+        const before = yield* sql<{ readonly updated_at: string }>`
+          SELECT updated_at FROM orchestration_v2_projection_threads WHERE thread_id = ${child.id}
+        `;
+        const changed = yield* offloadChild.pipe(
+          Effect.provideService(ThreadOffload.BeforeDelete, () =>
+            sql`
+              UPDATE orchestration_v2_projection_threads
+              SET updated_at = '2000-01-01T00:00:00.000Z' WHERE thread_id = ${child.id}
+            `.pipe(Effect.asVoid, Effect.orDie),
+          ),
+          Effect.flip,
+        );
+        assert.strictEqual(changed.reason, "conflict");
+        // The thread stays, with no record saying otherwise and no leftover bundle.
+        assert.isTrue(
+          Option.isNone(yield* ThreadOffload.readRecord(offload.offloadDirectory, child.id)),
+        );
+        assert.deepEqual(yield* bundles, []);
+        yield* sql`
+          UPDATE orchestration_v2_projection_threads
+          SET updated_at = ${before[0]!.updated_at} WHERE thread_id = ${child.id}
+        `;
+        yield* assertUnchanged;
+
+        const alone = yield* offloadChild;
+        // Any event will do as the shape of the recreated thread's first one.
+        const template = (yield* sql.unsafe<Record<string, unknown>>(
+          `SELECT * FROM orchestration_events WHERE sequence = (
+            SELECT MAX(sequence) FROM orchestration_events)`,
+        ))[0]!;
+        const restoreChild = offload.restore({ threadId: child.id });
+        const assertKept = Effect.gen(function* () {
+          assert.isTrue(yield* fs.exists(alone.bundlePath));
+          assert.isTrue(
+            Option.isSome(yield* ThreadOffload.readRecord(offload.offloadDirectory, child.id)),
+          );
+        });
+
+        // The thread was recreated under its id (as an importer would): its history differs.
+        const columns = Object.keys(template).filter((column) => column !== "sequence");
+        yield* sql.unsafe(
+          `INSERT INTO orchestration_events (${columns.join(", ")})
+           VALUES (${columns.map(() => "?").join(", ")})`,
+          columns.map((column) =>
+            column === "event_id"
+              ? "event:offload:recreated"
+              : column === "stream_id"
+                ? child.id
+                : template[column],
+          ),
+        );
+        const recreated = yield* restoreChild.pipe(Effect.flip);
+        assert.strictEqual(recreated.reason, "conflict");
+        assert.include(recreated.detail, "exists again with 1 event(s)");
+        yield* assertKept;
+        yield* sql`DELETE FROM orchestration_events WHERE event_id = 'event:offload:recreated'`;
+
+        // Rows of the thread without its events.
+        yield* sql`
+          INSERT INTO provider_session_runtime
+            (thread_id, provider_name, adapter_key, status, last_seen_at)
+          VALUES (${child.id}, 'claudeAgent', 'claudeAgent', 'stopped', '2026-01-01T00:00:00.000Z')
+        `;
+        const leftovers = yield* restoreChild.pipe(Effect.flip);
+        assert.strictEqual(leftovers.reason, "conflict");
+        assert.include(leftovers.detail, "provider_session_runtime");
+        yield* assertKept;
+        yield* sql`DELETE FROM provider_session_runtime WHERE thread_id = ${child.id}`;
+
+        // A schema other than the one the bundle was written from.
+        yield* sql`
+          INSERT INTO effect_sql_migrations (migration_id, name, created_at)
+          VALUES (100000, 'OffloadProbe', '2026-01-01 00:00:00')
+        `;
+        const newer = yield* restoreChild.pipe(Effect.flip);
+        assert.strictEqual(newer.reason, "conflict");
+        assert.include(newer.detail, "this one is at migration 100000");
+        yield* assertKept;
+        yield* sql`DELETE FROM effect_sql_migrations WHERE migration_id = 100000`;
+
+        // Its record is lost: the bundle alone brings it back.
+        yield* fs.remove(`${offload.offloadDirectory}/records/${threadKey(child.id)}.json`);
+        assert.strictEqual((yield* restoreChild.pipe(Effect.flip)).reason, "not-found");
+        const restored = yield* offload.restore({ bundlePath: alone.bundlePath });
+        assert.deepEqual(restored.threadIds, [child.id]);
+        yield* assertUnchanged;
+
+        // Restoring the kept bundle again finds the thread as it is and changes nothing.
+        const again = yield* offload.restore({ bundlePath: restored.bundlePath });
+        assert.deepEqual(again.threadIds, []);
+        assert.strictEqual(again.bundlePath, restored.bundlePath);
+        yield* assertUnchanged;
+      }).pipe(Effect.provide(layerFor(config.dbPath)));
+    }).pipe(
+      Effect.provide(
+        Layer.provideMerge(
+          ServerConfig.layerTest(process.cwd(), { prefix: "thread-offload-safety-" }),
+          NodeServices.layer,
+        ),
+      ),
+    ),
   );
 });
