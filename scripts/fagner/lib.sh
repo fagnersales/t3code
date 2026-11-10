@@ -82,6 +82,11 @@ running_app_pids() {
   done
 }
 
+# T3's backend server, the app's child. It can outlive the app while it closes its database, and an
+# app opened meanwhile finds the data directory owned ("This T3 home is unavailable") and quits.
+# macOS's pgrep -f does not match it, so ps.
+backend_pids() { /bin/ps -axo pid=,args= | /usr/bin/awk '/app\.asar\/apps\/desktop\/dist-electron\/compileCache\.cjs/ && !/awk/ {print $1}'; }
+
 # Squirrel's installer finishes a staged Nightly update after the app quits.
 shipit_pids() { /usr/bin/pgrep -x ShipIt || true; }
 
@@ -118,6 +123,14 @@ quit_t3_gracefully() {
     fi
     log "T3 Code has quit."
   fi
+  local backends
+  backends="$(backend_pids)"
+  if [ -n "$backends" ]; then
+    log "Waiting for T3's server to close (pids: $(echo $backends))..."
+    # shellcheck disable=SC2086
+    wait_for_exit 180 $backends || die "T3's server is still running after 180 s. Nothing was changed; quit it and run this again."
+    log "T3's server has closed."
+  fi
   local shipit
   shipit="$(shipit_pids)"
   if [ -n "$shipit" ]; then
@@ -148,9 +161,17 @@ launch_app() {
   for attempt in $(seq 1 "$LAUNCH_ATTEMPTS"); do
     open_like_dock "$app"
     sleep "$LAUNCH_SETTLE_SECONDS"
-    if [ -n "$(running_app_pids)" ]; then
+    if [ -n "$(running_app_pids)" ] && [ -n "$(backend_pids)" ]; then
       log "Launched $name"
       return 0
+    fi
+    # An app without its server is showing an error dialog; quit it before trying again.
+    if [ -n "$(running_app_pids)" ]; then
+      log "$name is open without its server (an error dialog); quitting it."
+      # shellcheck disable=SC2046
+      kill -TERM $(running_app_pids) 2>/dev/null || true
+      # shellcheck disable=SC2046
+      wait_for_exit 60 $(running_app_pids) || true
     fi
     log "$name quit right after launch (attempt $attempt of $LAUNCH_ATTEMPTS). Its processes still running:"
     /bin/ps -axo pid,etime,command | grep -F "/$name.app/" | grep -v -e grep -e ' follow ' | cut -c1-200 || true
