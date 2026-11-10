@@ -24,6 +24,49 @@ die() {
 
 plist_version() { /usr/bin/defaults read "$1/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null; }
 
+# Paths whose changes leave the app itself unchanged.
+APP_NEUTRAL_PATHS=(':(exclude)scripts/fagner' ':(exclude)docs/fork')
+
+# True when the working tree's app sources equal those of commit $1.
+same_app_sources() {
+  git -C "$FAGNER_REPO_ROOT" cat-file -e "$1^{commit}" 2>/dev/null &&
+    git -C "$FAGNER_REPO_ROOT" diff --quiet "$1" -- . "${APP_NEUTRAL_PATHS[@]}"
+}
+
+# The version this checkout builds as. The Mac and Linux builds of the same app sources share one:
+# a build folder whose `commit` file names a commit with the same app sources keeps its number.
+# Otherwise the next free -fagner.N past every build folder and the installed Mac app.
+version_for_checkout() {
+  local dir base_tag base installed n
+  for dir in "$FAGNER_BUILDS_DIR"/*-fagner.*; do
+    [ -f "$dir/commit" ] || continue
+    if same_app_sources "$(cat "$dir/commit")"; then
+      basename "$dir"
+      return 0
+    fi
+  done
+  base_tag="$(git -C "$FAGNER_REPO_ROOT" describe --tags --abbrev=0 --match 'v*-nightly.*' HEAD)"
+  base="${base_tag#v}"
+  # Builds from before the .noindex move have no folder; the installed app still counts.
+  installed="$(plist_version "/Applications/$FAGNER_APP_NAME.app" || true)"
+  n=1
+  case "$installed" in "$base-fagner."[0-9]*) n=$((${installed##*-fagner.} + 1)) ;; esac
+  while [ -e "$FAGNER_BUILDS_DIR/$base-fagner.$n" ]; do n=$((n + 1)); done
+  echo "$base-fagner.$n"
+}
+
+# Record the commit a build folder was made from, when the working tree's app sources are that
+# commit's (so a build of uncommitted changes is never reused for another platform).
+record_build_commit() {
+  local head
+  head="$(git -C "$FAGNER_REPO_ROOT" rev-parse HEAD)"
+  if same_app_sources "$head"; then
+    echo "$head" >"$1/commit"
+  else
+    log "The app sources have uncommitted changes; $1 is not recorded as commit $head."
+  fi
+}
+
 # Remote names differ between clones, so find them by URL.
 remote_for() {
   git -C "$FAGNER_REPO_ROOT" remote -v | awk -v repo="$1" '$2 ~ repo"(\\.git)?$" && $3 == "(fetch)" { print $1; exit }'

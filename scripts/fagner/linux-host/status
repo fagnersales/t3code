@@ -1,0 +1,34 @@
+#!/bin/bash
+# What T3 runs on this PC: the version and binary of the open window, what the launcher and the t3
+# CLI point at, the builds and rollback copies, and the threads (busy ones listed).
+#
+#   status [--threads]   --threads also prints every thread
+set -euo pipefail
+source "$(dirname "$0")/lib.sh"
+
+all=0
+case "${1:-}" in --threads) all=1 ;; -h | --help) sed -n '2,5p' "$0"; exit 0 ;; esac
+
+exe="$(running_app_exe)"
+if [ -n "$exe" ]; then
+  echo "running:   $(app_version "$(dirname "$exe")") ($exe, pid $(running_app_pids | head -1))"
+else
+  echo "running:   nothing"
+fi
+if [ -f "$LAUNCHER" ] && grep -qx "$LAUNCHER_MARK" "$LAUNCHER"; then
+  echo "launcher:  $(sed -n 's/^Exec=//p' "$LAUNCHER") ($LAUNCHER)"
+else
+  echo "launcher:  the package's /usr/share/applications/$LAUNCHER_ID"
+fi
+echo "t3 CLI:    $(sed -n "s/^app='\(.*\)'$/\1/p" "$CLI_SHIM") ($("$CLI_SHIM" --version 2>/dev/null | tail -1))"
+echo "fork:      $(app_version "$FAGNER_OPT") $FAGNER_OPT"
+echo "previous:  $(app_version "$FAGNER_OPT_PREVIOUS") $FAGNER_OPT_PREVIOUS"
+echo "package:   $(pacman -Q "$NIGHTLY_PACKAGE" 2>/dev/null || echo "$NIGHTLY_PACKAGE not installed")"
+echo "kept:      $(ls -d "$FAGNER_OPT_ROLLBACK"/nightly-* 2>/dev/null | tr '\n' ' ')"
+echo "builds:    $(ls "$FAGNER_LINUX_BUILDS" 2>/dev/null | grep -v '^latest$' | tr '\n' ' ')"
+threads="$(list_threads 2>/dev/null || true)"
+echo "threads:   $(echo "$threads" | grep -c . || true)"
+busy="$(echo "$threads" | grep -E "^($(echo "$BUSY_STATUSES" | tr ' ' '|'))	" || true)"
+echo "busy:      $(echo "$busy" | grep -c . || true)"
+[ -z "$busy" ] || echo "$busy" | sed 's/^/    /'
+if [ "$all" = 1 ]; then echo "$threads" | sed 's/^/    /'; fi

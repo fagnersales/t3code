@@ -1,0 +1,102 @@
+#!/bin/bash
+# Build and install the fork on a Linux PC (x64) from this Mac, over ssh.
+#
+#   scripts/fagner/linux build [--version V]   build this checkout's commit on the PC
+#   scripts/fagner/linux install --quit [--version V] [--force]
+#                                              make it the T3 the PC opens; refuses while a thread
+#                                              there is busy, unless --force
+#   scripts/fagner/linux rollback --quit [--force]   back to the PC's Nightly
+#   scripts/fagner/linux status [--threads]    what runs there, and its threads
+#   scripts/fagner/linux deploy [--force]      build, then install --quit
+#
+# The PC is $T3_FAGNER_LINUX_HOST (default acer@omarchy-acer). The build runs there (node-pty and
+# the libsecret helper must be compiled on Linux) and takes the same version as the Mac build of the
+# same app sources. install and rollback detach on the PC and log to
+# ~/.local/state/t3code-fagner/ there.
+set -euo pipefail
+source "$(dirname "$0")/lib.sh"
+
+HOST="${T3_FAGNER_LINUX_HOST:-acer@omarchy-acer}"
+REMOTE_SCRIPTS=".local/share/t3code-fagner/scripts"
+REMOTE_CACHE=".cache/t3code-fagner"
+
+remote() { ssh -o BatchMode=yes "$HOST" "$@"; }
+
+# The PC runs the scripts of this checkout.
+sync_scripts() {
+  remote "mkdir -p $REMOTE_SCRIPTS"
+  rsync -a --delete "$FAGNER_REPO_ROOT/scripts/fagner/linux-host/" "$HOST:$REMOTE_SCRIPTS/"
+}
+
+run_remote() {
+  local script="$1" arg quoted=""
+  shift
+  for arg in "$@"; do quoted="$quoted $(printf '%q' "$arg")"; done
+  remote "bash $REMOTE_SCRIPTS/$script$quoted"
+}
+
+build() {
+  local version="" head have bundle_dir bundle
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --version) version="$2"; shift ;;
+      *) die "Unknown option $1" ;;
+    esac
+    shift
+  done
+  cd "$FAGNER_REPO_ROOT"
+  head="$(git rev-parse HEAD)"
+  # The PC builds the commit, so uncommitted app changes would be left out.
+  same_app_sources "$head" || die "The app sources have uncommitted changes; commit them first."
+  [ -n "$version" ] || version="$(version_for_checkout)"
+  if remote "test -d $REMOTE_CACHE/builds/$version/app"; then
+    log "$HOST already has the Linux build $version."
+    return 0
+  fi
+  log "Linux build of $version from $(git rev-parse --short=10 HEAD) on $HOST"
+  sync_scripts
+
+  # Send only the commits the PC lacks: the whole history is about 800 MB.
+  bundle_dir="$(mktemp -d)"
+  bundle="$bundle_dir/src.bundle"
+  have="$(remote "git -C $REMOTE_CACHE/repo rev-parse -q --verify HEAD 2>/dev/null" || true)"
+  if remote "git -C $REMOTE_CACHE/repo cat-file -e $head^{commit} 2>/dev/null"; then
+    bundle=""
+  elif [ -n "$have" ] && git cat-file -e "$have^{commit}" 2>/dev/null; then
+    git bundle create -q "$bundle" HEAD "^$have"
+  else
+    git bundle create -q "$bundle" HEAD
+  fi
+  if [ -n "$bundle" ]; then
+    log "Sending $(du -h "$bundle" | cut -f1) of git objects..."
+    remote "mkdir -p $REMOTE_CACHE"
+    rsync -a "$bundle" "$HOST:$REMOTE_CACHE/src.bundle"
+    run_remote build --version "$version" --commit "$head" --bundle "$REMOTE_CACHE/src.bundle"
+  else
+    run_remote build --version "$version" --commit "$head"
+  fi
+  rm -rf "$bundle_dir"
+
+  # The Mac build of these sources takes the same version from this folder.
+  mkdir -p "$FAGNER_BUILDS_DIR/$version"
+  echo "$head" >"$FAGNER_BUILDS_DIR/$version/commit"
+  echo "$HOST:$REMOTE_CACHE/builds/$version" >"$FAGNER_BUILDS_DIR/$version/linux-x64"
+  log "Linux build $version is on $HOST. Install with: scripts/fagner/linux install --quit"
+}
+
+command="${1:-}"
+[ $# -gt 0 ] && shift
+case "$command" in
+  build) build "$@" ;;
+  install | rollback | status)
+    sync_scripts
+    run_remote "$command" "$@"
+    ;;
+  deploy)
+    build
+    sync_scripts
+    run_remote install --quit "$@"
+    ;;
+  -h | --help | "") sed -n '2,16p' "$0" ;;
+  *) die "Unknown command $command" ;;
+esac

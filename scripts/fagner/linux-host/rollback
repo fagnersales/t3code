@@ -1,0 +1,65 @@
+#!/bin/bash
+# Go back to the Nightly: quit the fork, point the launcher and the t3 CLI at the Nightly, relaunch.
+#
+#   rollback --quit            (refuses while a thread is busy; detaches itself)
+#   options: --force  --no-relaunch  --foreground
+#
+# Opens the pacman package's Nightly when it is still the version kept at install time (the one
+# that ran on this data); otherwise that kept copy in /opt/t3code-fagner-rollback, since a newer
+# Nightly would migrate the data forward. The fork stays in /opt/t3code-fagner for a later install.
+set -euo pipefail
+source "$(dirname "$0")/lib.sh"
+
+quit=0 relaunch=1 foreground=0 force=0
+args=("$@")
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --quit) quit=1 ;;
+    --no-relaunch) relaunch=0 ;;
+    --foreground) foreground=1 ;;
+    --force) force=1 ;;
+    -h | --help) sed -n '2,10p' "$0"; exit 0 ;;
+    *) die "Unknown option $1" ;;
+  esac
+  shift
+done
+
+# The kept Nightly that ran on this data (the newest, if several were kept).
+kept="$(ls -d "$FAGNER_OPT_ROLLBACK"/nightly-* 2>/dev/null | grep -v '\.partial$' | sort -V | tail -1 || true)"
+package_version="$(app_version "$NIGHTLY_OPT")"
+if [ -z "$kept" ] || [ "$(app_version "$kept")" = "$package_version" ]; then
+  target="$NIGHTLY_OPT"
+else
+  target="$kept"
+fi
+[ -x "$target/t3code" ] || die "No Nightly at $target."
+
+if [ -n "$(running_app_pids)" ]; then
+  [ "$quit" = 1 ] || die "T3 Code is running. Run again with --quit to quit it first."
+  check_not_busy "$force"
+fi
+
+if [ "$foreground" = 0 ]; then
+  detach_self "$(cd "$(dirname "$0")" && pwd)/$(basename "$0")" rollback "${args[@]+"${args[@]}"}"
+  exit 0
+fi
+
+log "rollback to Nightly $(app_version "$target") at $target started (pid $$)"
+if [ -n "$(running_app_pids)" ]; then
+  [ "$quit" = 1 ] || die "T3 Code is running. Run again with --quit to quit it first."
+  check_not_busy "$force"
+fi
+quit_t3_gracefully
+
+if [ "$target" = "$NIGHTLY_OPT" ]; then
+  remove_launcher
+else
+  log "The package is Nightly $package_version now, not the kept $(app_version "$target")."
+  write_launcher "$target" "T3 Code (Nightly $(app_version "$target"))"
+fi
+write_cli_shim "$target"
+
+if [ "$relaunch" = 1 ]; then
+  launch_app "$target"
+fi
+log "rollback finished. Back to the fork: scripts/fagner/linux install --quit"
