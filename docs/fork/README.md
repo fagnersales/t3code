@@ -51,6 +51,7 @@ backup.
 | `setup-signing`   | Makes the local certificate `build` signs with, once. macOS then takes every build for the same app and keeps the permissions granted to it.                  |
 | `update`          | Fetches upstream, merges the newest Nightly tag into `fagner/main` (stops if it adds migrations, unless `--accept-migrations`), installs, tests, builds.      |
 | `linux …`         | The same for the Linux PC (the Acer), run from the Mac: `build`, `install --quit`, `rollback --quit`, `status`, `deploy`. See [Linux PC](#linux-pc-the-acer). |
+| `shrink --quit`   | Quits T3, pauses Headquarters' device program, runs `t3 doctor --fix` (gives the database's free space back), then starts both again.                         |
 
 `install` and `rollback` never copy or open the database. Run without `--quit`, they refuse while
 T3 is running. They reopen T3 with the environment the Dock gives it and open it again if it quits
@@ -58,6 +59,15 @@ within seconds. With `--quit`, they detach into their own session (so quitting T
 cannot stop them), send T3 the same SIGTERM its own Quit path handles, wait up to 3 minutes for
 it to exit (never force), wait for a pending Nightly update install (ShipIt) to finish, then swap.
 Logs: `~/Library/Logs/t3code-fagner/`.
+
+Quitting T3 ends every chat, including the one that ran the script. From a chat, pass
+`--after 25` (`install` and `shrink`) so its reply goes out first, and schedule a wake-up for the
+chat to check the log once T3 is back.
+
+`t3 doctor --fix` refuses while any process has the database open. Headquarters' device program
+keeps `t3 thread follow` and `t3 project follow` running, which read it, so quitting T3 is not
+enough: `shrink` pauses its launchd job (`ink.fagner.headquarters.daemon`) and waits until nothing
+holds the file. At about 5 GiB live, the repair took 2 minutes.
 
 ## Switching to the fork
 

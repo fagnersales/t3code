@@ -4,13 +4,14 @@
 #   scripts/fagner/install --quit            quit the running T3, swap, relaunch (detaches itself)
 #   scripts/fagner/install                   only if T3 is not running
 #   options: --app PATH  --no-relaunch  --foreground (stay attached; used by the detached copy)
+#            --after SECONDS (wait first, so the chat that ran it can finish its reply)
 #
 # It never copies or touches the database: the fork adds no migrations, so the Nightly kept in
 # $FAGNER_ROLLBACK_DIR opens the same data (scripts/fagner/rollback).
 set -euo pipefail
 source "$(dirname "$0")/lib.sh"
 
-quit=0 relaunch=1 foreground=0 app=""
+quit=0 relaunch=1 foreground=0 app="" after=0
 args=("$@")
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -18,6 +19,7 @@ while [ $# -gt 0 ]; do
     --no-relaunch) relaunch=0 ;;
     --foreground) foreground=1 ;;
     --app) app="$2"; shift ;;
+    --after) after="$2"; shift ;;
     -h | --help) sed -n '2,10p' "$0"; exit 0 ;;
     *) die "Unknown option $1" ;;
   esac
@@ -31,6 +33,7 @@ if [ "$foreground" = 0 ]; then
 fi
 
 log "install started (pid $$)"
+[ "$after" = 0 ] || { log "Waiting $after s first."; sleep "$after"; }
 [ -n "$app" ] || app="$FAGNER_BUILDS_DIR/latest/$FAGNER_APP_NAME.app"
 app="$(cd "$(dirname "$app")" && pwd -P)/$(basename "$app")"
 [ -d "$app" ] || die "No build at $app. Run scripts/fagner/build first."

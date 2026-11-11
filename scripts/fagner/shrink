@@ -1,0 +1,88 @@
+#!/bin/bash
+# Give T3's database its free space back with `t3 doctor --fix`, then reopen T3.
+#
+#   scripts/fagner/shrink --quit             quit T3, shrink, reopen (detaches itself)
+#   options: --after SECONDS (wait first, so the chat that ran it can finish its reply)
+#            --foreground (stay attached; used by the detached copy)
+#
+# doctor refuses while anything has the database open, and Headquarters' device program keeps
+# `t3 … follow` processes reading it, so its launchd job is paused too and started again after.
+set -uo pipefail
+source "$(dirname "$0")/lib.sh"
+
+# VACUUM writes a copy of the live data and then its WAL; 12 GiB covers a database of about 5 GiB live.
+MIN_FREE_GIB=12
+HOLDERS_TIMEOUT_SECONDS=60
+HQ_LABEL="${T3_FAGNER_HQ_LABEL:-ink.fagner.headquarters.daemon}"
+HQ_PLIST="$HOME/Library/LaunchAgents/$HQ_LABEL.plist"
+HQ_JOB="gui/$(id -u)/$HQ_LABEL"
+FOLLOWS='app\.asar/apps/server/dist/bin\.mjs (project|thread) follow'
+DATABASE="$T3_HOME_DIR/userdata/statev2.sqlite"
+
+quit=0 foreground=0 after=0
+args=("$@")
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --quit) quit=1 ;;
+    --foreground) foreground=1 ;;
+    --after) after="$2"; shift ;;
+    -h | --help) sed -n '2,9p' "$0"; exit 0 ;;
+    *) die "Unknown option $1" ;;
+  esac
+  shift
+done
+[ "$quit" = 1 ] || die "Shrinking needs T3 closed: run with --quit."
+
+if [ "$foreground" = 0 ]; then
+  log_file="$HOME/Library/Logs/t3code-fagner/shrink-$(date '+%Y%m%d-%H%M%S').log"
+  detach_self "$(cd "$(dirname "$0")" && pwd)/$(basename "$0")" "$log_file" "${args[@]+"${args[@]}"}"
+  exit 0
+fi
+
+log "shrink started (pid $$)"
+[ "$after" = 0 ] || { log "Waiting $after s first."; sleep "$after"; }
+[ -f "$DATABASE" ] || die "No database at $DATABASE."
+free_gib="$(df -g "$DATABASE" | awk 'NR==2 {print $4}')"
+log "Free disk: $free_gib GiB. Database: $(du -h "$DATABASE" | cut -f1)."
+[ "$free_gib" -ge "$MIN_FREE_GIB" ] || die "Under $MIN_FREE_GIB GiB free. Nothing was changed."
+
+hq_paused=0
+reopen() {
+  if [ "$hq_paused" = 1 ] && ! /bin/launchctl print "$HQ_JOB" >/dev/null 2>&1; then
+    /bin/launchctl bootstrap "gui/$(id -u)" "$HQ_PLIST" && log "Headquarters' device program started again."
+  fi
+  [ -n "$(running_app_pids)" ] || launch_app "$FAGNER_APP"
+  log "shrink finished."
+}
+trap reopen EXIT
+
+quit_t3_gracefully
+if /bin/launchctl print "$HQ_JOB" >/dev/null 2>&1; then
+  log "Pausing Headquarters' device program."
+  /bin/launchctl bootout "$HQ_JOB" 2>/dev/null || true
+  hq_paused=1
+  /usr/bin/pkill -TERM -f "$FOLLOWS" 2>/dev/null || true
+fi
+
+waited=0
+while [ -n "$(/usr/sbin/lsof -t "$DATABASE" 2>/dev/null)" ] && [ "$waited" -lt "$HOLDERS_TIMEOUT_SECONDS" ]; do
+  sleep 1
+  waited=$((waited + 1))
+done
+holders="$(/usr/sbin/lsof -t "$DATABASE" 2>/dev/null | sort -u)"
+if [ -n "$holders" ]; then
+  log "Still open after $HOLDERS_TIMEOUT_SECONDS s by:"
+  for pid in $holders; do /bin/ps -o pid=,args= -p "$pid" | cut -c1-200; done
+  die "Not shrinking while the database is open."
+fi
+
+log "t3 doctor --fix starting."
+start=$(date +%s)
+"$CLI_SHIM" doctor --fix </dev/null
+status=$?
+took=$(($(date +%s) - start))
+if [ "$status" = 0 ]; then
+  log "t3 doctor --fix finished in $took s. Database now $(du -h "$DATABASE" | cut -f1)."
+else
+  log "t3 doctor --fix FAILED after $took s (exit $status)."
+fi
