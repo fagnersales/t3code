@@ -54,6 +54,7 @@ import {
 } from "@t3tools/client-runtime/environment";
 import {
   AuthOrchestrationOperateScope,
+  AuthSettingsWriteScope,
   ProjectId,
   type ScopedThreadRef,
   type ThreadId,
@@ -63,8 +64,6 @@ import type { OlderSettledScope } from "@t3tools/client-runtime/state/threads";
 import {
   CheckIcon,
   ChevronDownIcon,
-  EyeIcon,
-  EyeOffIcon,
   FolderIcon,
   ListFilterIcon,
   PlusIcon,
@@ -147,12 +146,13 @@ import {
   useQuietThreadShells,
 } from "../state/entities";
 import { environmentPresentations } from "../state/presentation";
-import { primaryServerKeybindingsAtom } from "../state/server";
+import { primaryServerKeybindingsAtom, serverEnvironment } from "../state/server";
 import { environmentProjects } from "../state/projects";
 import { threadEnvironment } from "../state/threads";
 import { useOlderSettledShelf, useOlderSettledShelfGrowth } from "../state/olderSettledShelf";
 import { useThreadSearch } from "../state/queries";
 import { useOrchestrationCommand } from "../state/use-orchestration-command";
+import { useAtomCommand } from "../state/use-atom-command";
 import { readEnvironmentScope, useEnvironmentScope } from "../state/session";
 import { appAtomRegistry } from "../rpc/atomRegistry";
 import { canShareWithGuestAtom } from "./chat/guestShareAvailability";
@@ -170,13 +170,19 @@ import {
   buildDraftActionMenuItems,
   buildThreadActionMenuItems,
   threadActionRequiresOperate,
+  buildWorkspaceMoveMenuItem,
+  workspaceOfMoveMenuId,
 } from "./threadActionMenu.logic";
 import {
   applySidebarThreadDrop,
   filterSidebarV2VisibleThreads,
   groupSidebarThreadsByProject,
-  groupedSidebarThreadKeys,
-  hideGroupedSidebarThreads,
+  filterSidebarWorkspaceThreads,
+  resolveSidebarThreadWorkspace,
+  sidebarWorkspaceMembership,
+  sidebarWorkspaceMoveTargets,
+  type SidebarWorkspace,
+  workspaceJoinedByNewThread,
   sidebarFolderExpansionKeys,
   buildBulkTitleRegenerationContextMenuItem,
   buildBulkUnpinContextMenuItem,
@@ -256,6 +262,7 @@ import {
   type SidebarSweepAction,
 } from "./sidebar/SidebarThreadRow";
 import { SidebarDraftBlock } from "./sidebar/SidebarDraftBlock";
+import { SidebarWorkspaceSwitch } from "./sidebar/SidebarWorkspaceSwitch";
 import {
   SidebarProjectFolderHeader,
   sidebarFolderRowId,
@@ -323,7 +330,13 @@ const SETTLED_TAIL_PAGE_COUNT = 25;
 const SETTLED_SHELF_EXPANDED_KEY = "t3code:sidebar:settled-expanded";
 const SNOOZED_SHELF_EXPANDED_KEY = "t3code:sidebar:snoozed-expanded";
 const WORKING_SHELF_EXPANDED_KEY = "t3code:sidebar:working-expanded";
-const SHOW_GROUPED_THREADS_KEY = "t3code:sidebar:show-thread-groups";
+// Fork: the workspace this window shows, null for Threads.
+const SIDEBAR_WORKSPACE_KEY = "t3code:sidebar:workspace";
+const STORED_WORKSPACE_SCHEMA = Schema.NullOr(Schema.String);
+const THREADS_WORKSPACE_LABEL = "Threads";
+
+const threadRefKey = (environmentId: EnvironmentId, threadId: ThreadId) =>
+  scopedThreadKey(scopeThreadRef(environmentId, threadId));
 
 const inboxReturns = createInboxReturnTracker();
 
@@ -1089,23 +1102,99 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
           ),
         );
   const isSearchingThreads = threadSearchQuery.trim().length > 0;
-  const [showGroupedThreads, setShowGroupedThreads] = useLocalStorage(
-    SHOW_GROUPED_THREADS_KEY,
-    false,
-    Schema.Boolean,
+  const [storedWorkspace, setStoredWorkspace] = useLocalStorage(
+    SIDEBAR_WORKSPACE_KEY,
+    null,
+    STORED_WORKSPACE_SCHEMA,
   );
-  const groupedThreadKeys = groupedSidebarThreadKeys(serverConfigs, (environmentId, threadId) =>
-    scopedThreadKey(scopeThreadRef(environmentId, threadId)),
-  );
-  const threadGroupNames = [...new Set(groupedThreadKeys.values())].toSorted().join(", ");
-  const { threads: listedThreads, hidden: hiddenGroupedThreadCount } = hideGroupedSidebarThreads({
+  const workspaceMembership = sidebarWorkspaceMembership(serverConfigs, threadRefKey);
+  const workspaceNames = workspaceMembership.names;
+  // A workspace whose group is gone reads as Threads; the choice returns with the group.
+  const sidebarWorkspace =
+    storedWorkspace !== null && workspaceNames.includes(storedWorkspace) ? storedWorkspace : null;
+  const shellByKey = new Map(threads.map((thread) => [threadShellKey(thread), thread] as const));
+  const workspaceOfThread = (thread: EnvironmentThreadShell) =>
+    resolveSidebarThreadWorkspace({
+      thread,
+      placed: workspaceMembership.placed,
+      threadByKey: shellByKey,
+      keyOf: threadRefKey,
+    });
+  const { threads: workspaceThreads, waiting: waitingByWorkspace } = filterSidebarWorkspaceThreads({
     threads,
-    grouped: groupedThreadKeys,
-    show: showGroupedThreads,
+    workspace: sidebarWorkspace,
+    workspaceOf: workspaceOfThread,
     openKey: routeRowThreadKey,
-    delegatedUnderParent,
     keyOf: threadShellKey,
   });
+  // Search looks through every workspace, so a thread is found wherever it is.
+  const listedThreads =
+    workspaceNames.length === 0 || isSearchingThreads ? threads : workspaceThreads;
+  const persistServerSettings = useAtomCommand(serverEnvironment.updateSettings, {
+    label: "thread workspace move",
+    reportFailure: false,
+  });
+  const moveThreadsToWorkspace = useStableCallback(
+    (
+      targets: ReadonlyArray<Pick<EnvironmentThreadShell, "environmentId" | "id">>,
+      workspace: SidebarWorkspace,
+    ) => {
+      const byEnvironment = new Map<EnvironmentId, ThreadId[]>();
+      for (const thread of targets) {
+        byEnvironment.set(thread.environmentId, [
+          ...(byEnvironment.get(thread.environmentId) ?? []),
+          thread.id,
+        ]);
+      }
+      return Promise.all(
+        [...byEnvironment].map(async ([environmentId, threadIds]) => {
+          const result = await persistServerSettings({
+            environmentId,
+            input: {
+              patch: {
+                threadWorkspaceChoices: Object.fromEntries(
+                  threadIds.map((threadId) => [threadId, { workspace }]),
+                ),
+              },
+            },
+          });
+          if (result._tag !== "Failure" || isAtomCommandInterrupted(result)) return;
+          const error = squashAtomCommandFailure(result);
+          toastManager.add(
+            stackedThreadToast({
+              type: "error",
+              title: `Could not move to ${workspace ?? THREADS_WORKSPACE_LABEL}`,
+              description: error instanceof Error ? error.message : "The settings were not saved.",
+            }),
+          );
+        }),
+      );
+    },
+  );
+  // A thread the user makes while a workspace is shown joins it, or it would leave the list.
+  const routeShell = routeRowThreadKey === null ? undefined : shellByKey.get(routeRowThreadKey);
+  const routeShellPlaced =
+    routeRowThreadKey !== null && workspaceMembership.placed.has(routeRowThreadKey);
+  const joinsInFlightRef = useRef(new Set<string>());
+  const joinNewThread = useStableCallback(
+    (thread: EnvironmentThreadShell, workspace: SidebarWorkspace, placed: boolean) => {
+      const key = threadShellKey(thread);
+      const joined = workspaceJoinedByNewThread({
+        thread,
+        workspace,
+        placed,
+        nowMs: Date.now(),
+      });
+      if (joined === null || joinsInFlightRef.current.has(key)) return;
+      // Stays in flight after a failure, so one toast says so instead of one per render.
+      joinsInFlightRef.current.add(key);
+      void moveThreadsToWorkspace([thread], joined);
+    },
+  );
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- saves on the thread's server that a thread just made here is in the shown workspace; the server's settings are outside React
+  useEffect(() => {
+    if (routeShell !== undefined) joinNewThread(routeShell, sidebarWorkspace, routeShellPlaced);
+  }, [routeShell, routeShellPlaced, sidebarWorkspace, joinNewThread]);
 
   // History, the palette and links can open a thread the scope hides or the list
   // scrolled away; a remount starts at the top, so each mount scrolls to the open
@@ -2253,6 +2342,19 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
       const unpinMenuItem = buildBulkUnpinContextMenuItem({
         pinnedCount: pinnedSelectedThreads.length,
       });
+      const workspaceMoveMenuItem =
+        workspaceNames.length === 0
+          ? null
+          : buildWorkspaceMoveMenuItem({
+              targets: sidebarWorkspaceMoveTargets(
+                selectedThreads.map(workspaceOfThread),
+                workspaceNames,
+              ),
+              count,
+              disabled: !selectedThreads.every((thread) =>
+                readEnvironmentScope(thread.environmentId, AuthSettingsWriteScope),
+              ),
+            });
       // Presets sync across environments, so the first selected thread's stand for all.
       // oxlint-disable-next-line react/purity -- runs in an event handler (oxc#27309)
       const menuOpenedAt = new Date();
@@ -2305,6 +2407,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                 ]
               : []),
             { id: "mark-unread", label: `Mark unread (${count})` },
+            ...(workspaceMoveMenuItem ? [workspaceMoveMenuItem] : []),
             {
               id: "delete",
               label: `Delete (${count})`,
@@ -2316,6 +2419,15 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
         ),
       );
       if (clicked._tag === "Failure" || clicked.value === null) return;
+      const moveTarget = workspaceOfMoveMenuId(clicked.value);
+      if (moveTarget !== undefined) {
+        clearSelection();
+        await moveThreadsToWorkspace(
+          selectedThreads.filter((thread) => workspaceOfThread(thread) !== moveTarget),
+          moveTarget,
+        );
+        return;
+      }
       const actionTargets =
         clicked.value === "unpin"
           ? pinnedSelectedThreads
@@ -2586,6 +2698,20 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                 canShareWithGuestAtom(threadRef.environmentId),
               ),
               canTurnIntoProject: canTurnThreadIntoProject(threadRef),
+              workspaceMove:
+                workspaceNames.length === 0
+                  ? null
+                  : buildWorkspaceMoveMenuItem({
+                      targets: sidebarWorkspaceMoveTargets(
+                        [workspaceOfThread(thread)],
+                        workspaceNames,
+                      ),
+                      count: null,
+                      disabled: !readEnvironmentScope(
+                        threadRef.environmentId,
+                        AuthSettingsWriteScope,
+                      ),
+                    }),
               supports: {
                 settlement: configLoaded,
                 autoSettleOptOut: supportsAutoSettleOptOut,
@@ -2600,6 +2726,11 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
         );
         if (clicked._tag === "Failure" || clicked.value === null) return;
         if (threadActionRequiresOperate(clicked.value) && !checkThreadOperations([thread])) return;
+        const moveTarget = workspaceOfMoveMenuId(clicked.value);
+        if (moveTarget !== undefined) {
+          void moveThreadsToWorkspace([thread], moveTarget);
+          return;
+        }
         if (clicked.value?.startsWith("snooze:")) {
           const preset =
             clicked.value === "snooze:custom"
@@ -3088,25 +3219,18 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                   </ComboboxPopup>
                 </Combobox>
               }
-              threadGroupsToggle={
-                threadGroupNames === "" ? null : (
-                  <SidebarHeaderIconButton
-                    label={
-                      showGroupedThreads
-                        ? `Hide ${threadGroupNames} threads`
-                        : `Show ${threadGroupNames} threads (${hiddenGroupedThreadCount} hidden)`
-                    }
-                    aria-pressed={showGroupedThreads}
-                    data-testid="sidebar-thread-groups-toggle"
-                    onClick={() => setShowGroupedThreads((shown) => !shown)}
-                  >
-                    {showGroupedThreads ? <EyeIcon /> : <EyeOffIcon />}
-                    {!showGroupedThreads && hiddenGroupedThreadCount > 0 ? (
-                      <span className="pointer-events-none absolute -top-0.5 -right-0.5 min-w-3.5 rounded-full bg-accent px-0.5 text-center text-3xs leading-3.5 font-medium tabular-nums text-foreground/80">
-                        {hiddenGroupedThreadCount}
-                      </span>
-                    ) : null}
-                  </SidebarHeaderIconButton>
+              workspaceSwitch={
+                workspaceNames.length === 0 ? null : (
+                  <SidebarWorkspaceSwitch
+                    names={workspaceNames}
+                    workspace={sidebarWorkspace}
+                    waiting={waitingByWorkspace}
+                    onChange={(workspace) => {
+                      // A selection made in one workspace holds threads the next one hides.
+                      clearSelection();
+                      setStoredWorkspace(workspace);
+                    }}
+                  />
                 )
               }
               onNewProject={openAddProjectCommandPalette}

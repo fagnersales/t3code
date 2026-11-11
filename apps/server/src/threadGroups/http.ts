@@ -18,7 +18,7 @@ import * as ServerSettings from "../serverSettings.ts";
 
 const NO_STORE = { "cache-control": "no-store" };
 
-const problem = (status: number, message: string) =>
+export const problem = (status: number, message: string) =>
   HttpServerResponse.jsonUnsafe({ message }, { status, headers: NO_STORE });
 
 const encodeResponse = Schema.encodeSync(ThreadGroupsResponse);
@@ -28,7 +28,9 @@ const respond = (groups: ThreadGroups) =>
   HttpServerResponse.jsonUnsafe(encodeResponse({ groups }), { headers: NO_STORE });
 
 /** The response to send instead, when the request's session lacks `scope`. */
-const refusal = Effect.fn("ThreadGroupsHttp.refusal")(function* (scope: AuthEnvironmentScope) {
+export const refusal = Effect.fn("ThreadGroupsHttp.refusal")(function* (
+  scope: AuthEnvironmentScope,
+) {
   const request = yield* HttpServerRequest.HttpServerRequest;
   const auth = yield* EnvironmentAuth.EnvironmentAuth;
   const session = yield* auth.authenticateHttpRequest(request).pipe(Effect.option);

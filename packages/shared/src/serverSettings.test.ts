@@ -928,3 +928,24 @@ describe("threadGroups", () => {
     );
   });
 });
+
+describe("threadWorkspaceChoices", () => {
+  const a = ThreadId.make("thread-a");
+  const b = ThreadId.make("thread-b");
+  const saved = applyServerSettingsPatch(DEFAULT_SERVER_SETTINGS, {
+    threadGroups: { Headquarters: [a] },
+    threadWorkspaceChoices: { [a]: { workspace: null }, [b]: { workspace: "Headquarters" } },
+  });
+
+  it("sets and forgets one thread's choice and keeps the others", () => {
+    const next = applyServerSettingsPatch(saved, {
+      threadWorkspaceChoices: { [a]: null, [b]: { workspace: null } },
+    });
+    expect(next.threadWorkspaceChoices).toEqual({ [b]: { workspace: null } });
+  });
+
+  it("survives every write t3 thread group makes", () => {
+    const next = applyServerSettingsPatch(saved, { threadGroups: { Headquarters: null } });
+    expect(next.threadWorkspaceChoices).toEqual(saved.threadWorkspaceChoices);
+  });
+});

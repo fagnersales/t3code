@@ -14,7 +14,14 @@ import {
   type ThreadSearchShell,
 } from "@t3tools/client-runtime/state/thread-search";
 import { foldSearchQuery, rankSearchItems, scoreThreadSearch } from "@t3tools/shared/paletteSearch";
-import type { ContextMenuItem, EnvironmentId, ThreadId } from "@t3tools/contracts";
+import {
+  type ContextMenuItem,
+  type EnvironmentId,
+  type ThreadGroups,
+  type ThreadId,
+  type ThreadWorkspaceChoices,
+  threadWorkspaceMembership,
+} from "@t3tools/contracts";
 import type { SidebarProjectSortOrder, SidebarThreadSortOrder } from "@t3tools/contracts/settings";
 import type { AsyncResult } from "effect/reactivity";
 import {
@@ -591,58 +598,117 @@ export function filterSidebarV2VisibleThreads<
   );
 }
 
+/** Fork: a sidebar workspace. null is Threads: every thread no group or move puts elsewhere. */
+export type SidebarWorkspace = string | null;
+
+type SidebarWorkspaceSettings = {
+  readonly threadGroups?: ThreadGroups;
+  readonly threadWorkspaceChoices?: ThreadWorkspaceChoices;
+};
+
 /**
- * Fork: the threads the server settings' `threadGroups` name, such as the ones Headquarters runs,
- * keyed like sidebar rows, with their group's name.
+ * Fork: every environment's groups are workspaces. `placed` holds each thread a group or a move
+ * puts somewhere, keyed like sidebar rows; a move wins over the group, both ways.
  */
-export function groupedSidebarThreadKeys(
-  serverConfigs: ReadonlyMap<
-    EnvironmentId,
-    { readonly settings: { readonly threadGroups?: Readonly<Record<string, readonly ThreadId[]>> } }
-  >,
+export function sidebarWorkspaceMembership(
+  serverConfigs: ReadonlyMap<EnvironmentId, { readonly settings: SidebarWorkspaceSettings }>,
   keyOf: (environmentId: EnvironmentId, threadId: ThreadId) => string,
-): ReadonlyMap<string, string> {
-  const grouped = new Map<string, string>();
-  for (const [environmentId, config] of serverConfigs) {
-    for (const [group, threadIds] of Object.entries(config.settings.threadGroups ?? {})) {
-      for (const threadId of threadIds) grouped.set(keyOf(environmentId, threadId), group);
+): { readonly names: readonly string[]; readonly placed: ReadonlyMap<string, SidebarWorkspace> } {
+  const names = new Set<string>();
+  const placed = new Map<string, SidebarWorkspace>();
+  for (const [environmentId, { settings }] of serverConfigs) {
+    const groups = settings.threadGroups ?? {};
+    for (const group of Object.keys(groups)) names.add(group);
+    const membership = threadWorkspaceMembership(groups, settings.threadWorkspaceChoices ?? {});
+    for (const [threadId, workspace] of membership) {
+      placed.set(keyOf(environmentId, threadId), workspace);
     }
   }
-  return grouped;
+  return { names: [...names].toSorted(), placed };
 }
 
 /**
- * Leaves out grouped threads unless they are shown, except the open one. `hidden` counts the rows
- * left out; a thread shown under its parent has no row of its own.
+ * The workspace of a thread: where a group or a move puts it, else its parent's (a subagent, a
+ * delegated task, a fork), else Threads.
  */
-export function hideGroupedSidebarThreads<
-  T extends Pick<SidebarThreadSummary, "archivedAt" | "environmentId" | "id" | "lineage">,
+export function resolveSidebarThreadWorkspace<
+  T extends Pick<SidebarThreadSummary, "environmentId" | "id" | "lineage">,
+>(input: {
+  readonly thread: T;
+  readonly placed: ReadonlyMap<string, SidebarWorkspace>;
+  readonly threadByKey: ReadonlyMap<string, T>;
+  readonly keyOf: (environmentId: EnvironmentId, threadId: ThreadId) => string;
+}): SidebarWorkspace {
+  const { placed, threadByKey, keyOf } = input;
+  const visited = new Set<string>();
+  let thread: T | undefined = input.thread;
+  while (thread !== undefined) {
+    const key = keyOf(thread.environmentId, thread.id);
+    if (visited.has(key)) return null;
+    visited.add(key);
+    const workspace = placed.get(key);
+    if (workspace !== undefined) return workspace;
+    const parentId: ThreadId | null = thread.lineage.parentThreadId;
+    thread = parentId === null ? undefined : threadByKey.get(keyOf(thread.environmentId, parentId));
+  }
+  return null;
+}
+
+/**
+ * Lists the threads of `workspace`, and the open thread wherever it is. `waiting` counts, per other
+ * workspace, the threads left out that wait on the user: an approval or a question.
+ */
+export function filterSidebarWorkspaceThreads<
+  T extends Pick<
+    SidebarThreadSummary,
+    "archivedAt" | "environmentId" | "id" | "hasPendingApprovals" | "hasPendingUserInput"
+  >,
 >(input: {
   readonly threads: readonly T[];
-  readonly grouped: ReadonlyMap<string, string>;
-  readonly show: boolean;
+  readonly workspace: SidebarWorkspace;
+  readonly workspaceOf: (thread: T) => SidebarWorkspace;
   readonly openKey: string | null;
-  readonly delegatedUnderParent: ReadonlySet<string>;
   readonly keyOf: (thread: T) => string;
-}): { readonly threads: readonly T[]; readonly hidden: number } {
-  const { threads, grouped, show, openKey, delegatedUnderParent, keyOf } = input;
-  if (show || grouped.size === 0) return { threads, hidden: 0 };
-  let hidden = 0;
-  const visible = threads.filter((thread) => {
-    const key = keyOf(thread);
-    if (!grouped.has(key) || key === openKey) return true;
-    if (
-      thread.archivedAt === null &&
-      !isShownUnderParent(
-        { environmentId: thread.environmentId, threadId: thread.id },
-        thread.lineage,
-        delegatedUnderParent,
-      )
-    )
-      hidden += 1;
+}): { readonly threads: readonly T[]; readonly waiting: ReadonlyMap<SidebarWorkspace, number> } {
+  const { workspace, workspaceOf, openKey, keyOf } = input;
+  const waiting = new Map<SidebarWorkspace, number>();
+  const threads = input.threads.filter((thread) => {
+    const own = workspaceOf(thread);
+    if (own === workspace || keyOf(thread) === openKey) return true;
+    if (thread.archivedAt === null && (thread.hasPendingApprovals || thread.hasPendingUserInput)) {
+      waiting.set(own, (waiting.get(own) ?? 0) + 1);
+    }
     return false;
   });
-  return { threads: visible, hidden };
+  return { threads, waiting };
+}
+
+/** How long after its first message a thread the user made still joins the shown workspace. */
+export const NEW_THREAD_JOIN_WINDOW_MS = 2 * 60 * 1000;
+
+/**
+ * The workspace a thread joins when it opens: the shown one, for a thread the user just made that
+ * no group or move places, so it does not vanish from the list. Null when it joins none.
+ */
+export function workspaceJoinedByNewThread(input: {
+  readonly thread: Pick<SidebarThreadSummary, "createdAt" | "source">;
+  readonly workspace: SidebarWorkspace;
+  readonly placed: boolean;
+  readonly nowMs: number;
+}): string | null {
+  const { thread, workspace, placed, nowMs } = input;
+  if (workspace === null || placed || thread.source.createdBy !== "user") return null;
+  const age = nowMs - Date.parse(thread.createdAt);
+  // Either way: the server stamps createdAt, and its clock may run ahead of this one.
+  return Math.abs(age) <= NEW_THREAD_JOIN_WINDOW_MS ? workspace : null;
+}
+
+/** The workspaces some of `current` (the threads' own) can move to, Threads first. */
+export function sidebarWorkspaceMoveTargets(
+  current: readonly SidebarWorkspace[],
+  names: readonly string[],
+): SidebarWorkspace[] {
+  return [null, ...names].filter((target) => current.some((workspace) => workspace !== target));
 }
 
 export function buildBulkTitleRegenerationContextMenuItem(input: {

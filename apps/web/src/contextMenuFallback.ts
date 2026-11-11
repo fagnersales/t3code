@@ -3,6 +3,12 @@ import type { ContextMenuItem } from "@t3tools/contracts";
 const SVG_NS = "http://www.w3.org/2000/svg";
 
 const ICON_PATHS: Record<string, ReadonlyArray<{ tag: string; attrs: Record<string, string> }>> = {
+  "arrow-right-left": [
+    { tag: "path", attrs: { d: "m16 3 4 4-4 4" } },
+    { tag: "path", attrs: { d: "M20 7H4" } },
+    { tag: "path", attrs: { d: "m8 21-4-4 4-4" } },
+    { tag: "path", attrs: { d: "M4 17h16" } },
+  ],
   archive: [
     { tag: "rect", attrs: { width: "20", height: "5", x: "2", y: "3", rx: "1" } },
     { tag: "path", attrs: { d: "M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8" } },

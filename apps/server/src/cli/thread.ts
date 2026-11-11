@@ -38,6 +38,7 @@ import { readPersistedServerRuntimeState } from "../serverRuntimeState.ts";
 import { projectLocationFlags, resolveCliAuthConfig } from "./config.ts";
 import { threadFollowCommand } from "./threadFollow.ts";
 import { threadGroupCommand } from "./threadGroup.ts";
+import { threadWorkspaceCommand } from "./threadWorkspace.ts";
 import {
   offloadNotice,
   threadOffloadCommand,
@@ -874,6 +875,7 @@ export const threadCommand = Command.make("thread").pipe(
     threadShowCommand,
     threadFollowCommand,
     threadGroupCommand,
+    threadWorkspaceCommand,
     threadOffloadCommand,
     threadRestoreCommand,
     threadPruneRestoredCommand,

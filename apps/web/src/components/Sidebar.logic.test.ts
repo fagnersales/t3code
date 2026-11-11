@@ -9,9 +9,13 @@ import {
   archiveSelectedThreadEntries,
   deleteSelectedThreadEntries,
   getFallbackThreadIdAfterDelete,
-  groupedSidebarThreadKeys,
-  hideGroupedSidebarThreads,
+  filterSidebarWorkspaceThreads,
   hasUnseenCompletion,
+  resolveSidebarThreadWorkspace,
+  sidebarWorkspaceMembership,
+  sidebarWorkspaceMoveTargets,
+  NEW_THREAD_JOIN_WINDOW_MS,
+  workspaceJoinedByNewThread,
   resolveSidebarRowThreadId,
   orderItemsByPreferredIds,
   pinOrderKeyBetween,
@@ -1450,60 +1454,153 @@ describe("resolveSidebarFolderDot", () => {
   });
 });
 
-describe("grouped sidebar threads", () => {
-  const environmentId = EnvironmentId.make("environment-groups");
+describe("sidebar workspaces", () => {
+  const environmentId = EnvironmentId.make("environment-workspaces");
+  const otherEnvironmentId = EnvironmentId.make("environment-other");
   const keyOf = (environment: EnvironmentId, threadId: ThreadId) => `${environment}:${threadId}`;
   const rowKey = (thread: { environmentId: EnvironmentId; id: ThreadId }) =>
     keyOf(thread.environmentId, thread.id);
-  const mine = makeThreadFixture({ id: ThreadId.make("thread-mine"), environmentId });
-  const hq = makeThreadFixture({ id: ThreadId.make("thread-hq"), environmentId });
-  const hqOpen = makeThreadFixture({ id: ThreadId.make("thread-hq-open"), environmentId });
-  const hqChild = makeThreadFixture({
-    id: ThreadId.make("thread-hq-child"),
-    environmentId,
+  const thread = (id: string, extra: Partial<Thread> = {}, environment = environmentId) => ({
+    ...makeThreadFixture({ id: ThreadId.make(id), environmentId: environment }),
+    ...extra,
+  });
+  const mine = thread("thread-mine");
+  const hq = thread("thread-hq");
+  const hqMovedOut = thread("thread-hq-moved-out");
+  const movedIn = thread("thread-blox-in-hq");
+  const hqChild = thread("thread-hq-child", {
     lineage: { rootThreadId: hq.id, parentThreadId: hq.id, relationshipToParent: "subagent" },
   });
-  const grouped = groupedSidebarThreadKeys(
+  // Same id as an HQ thread, on a server whose groups do not name it.
+  const elsewhere = thread("thread-hq", {}, otherEnvironmentId);
+  const threads = [mine, hq, hqMovedOut, movedIn, hqChild, elsewhere];
+  const membership = sidebarWorkspaceMembership(
     new Map([
       [
         environmentId,
-        { settings: { threadGroups: { Headquarters: [hq.id, hqOpen.id, hqChild.id] } } },
+        {
+          settings: {
+            threadGroups: { Headquarters: [hq.id, hqMovedOut.id] },
+            threadWorkspaceChoices: {
+              [hqMovedOut.id]: { workspace: null },
+              [movedIn.id]: { workspace: "Headquarters" },
+              // A deleted thread's choice places nothing anyone lists.
+              [ThreadId.make("thread-deleted")]: { workspace: "Headquarters" },
+            },
+          },
+        },
       ],
+      [otherEnvironmentId, { settings: {} }],
     ]),
     keyOf,
   );
-  const threads = [mine, hq, hqOpen, hqChild];
+  const threadByKey = new Map(threads.map((entry) => [rowKey(entry), entry] as const));
+  const workspaceOf = (entry: (typeof threads)[number]) =>
+    resolveSidebarThreadWorkspace({
+      thread: entry,
+      placed: membership.placed,
+      threadByKey,
+      keyOf,
+    });
+  const list = (workspace: string | null, openKey: string | null = null) =>
+    filterSidebarWorkspaceThreads({ threads, workspace, workspaceOf, openKey, keyOf: rowKey });
 
-  it("keys every grouped thread by its sidebar row with its group", () => {
-    expect([...grouped]).toEqual([
-      [rowKey(hq), "Headquarters"],
-      [rowKey(hqOpen), "Headquarters"],
-      [rowKey(hqChild), "Headquarters"],
+  it("names each group as a workspace", () => {
+    expect(membership.names).toEqual(["Headquarters"]);
+  });
+
+  it("puts the group's threads in it, and moves win both ways", () => {
+    expect(workspaceOf(hq)).toBe("Headquarters");
+    expect(workspaceOf(hqMovedOut)).toBeNull();
+    expect(workspaceOf(movedIn)).toBe("Headquarters");
+    expect(workspaceOf(mine)).toBeNull();
+  });
+
+  it("keys every environment apart", () => {
+    expect(workspaceOf(elsewhere)).toBeNull();
+  });
+
+  it("puts a subagent, delegated task or fork in its parent's workspace", () => {
+    expect(workspaceOf(hqChild)).toBe("Headquarters");
+  });
+
+  it("joins a thread the user just made to the shown workspace", () => {
+    const createdAt = "2026-11-11T12:00:00.000Z";
+    const nowMs = Date.parse(createdAt) + 5_000;
+    const made = thread("thread-made", { createdAt });
+    const join = (overrides: Partial<Parameters<typeof workspaceJoinedByNewThread>[0]>) =>
+      workspaceJoinedByNewThread({
+        thread: made,
+        workspace: "Headquarters",
+        placed: false,
+        nowMs,
+        ...overrides,
+      });
+    expect(join({})).toBe("Headquarters");
+    expect(join({ workspace: null })).toBeNull();
+    expect(join({ placed: true })).toBeNull();
+    expect(join({ nowMs: nowMs + NEW_THREAD_JOIN_WINDOW_MS })).toBeNull();
+    // A thread an agent launched joins nothing; only its parent link, if any, places it.
+    expect(
+      join({ thread: { ...made, source: { ...made.source, createdBy: "agent" } } }),
+    ).toBeNull();
+  });
+
+  it("lists only the shown workspace's threads", () => {
+    expect(list(null).threads.map((entry) => entry.id)).toEqual([
+      mine.id,
+      hqMovedOut.id,
+      elsewhere.id,
+    ]);
+    expect(list("Headquarters").threads.map((entry) => entry.id)).toEqual([
+      hq.id,
+      movedIn.id,
+      hqChild.id,
     ]);
   });
 
-  it("hides grouped threads but the open one, and counts only rows of their own", () => {
-    const result = hideGroupedSidebarThreads({
-      threads,
-      grouped,
-      show: false,
-      openKey: rowKey(hqOpen),
-      delegatedUnderParent: new Set(),
-      keyOf: rowKey,
-    });
-    expect(result.threads.map((thread) => thread.id)).toEqual([mine.id, hqOpen.id]);
-    expect(result.hidden).toBe(1);
+  it("keeps the open thread listed in any workspace", () => {
+    expect(list(null, rowKey(hq)).threads.map((entry) => entry.id)).toContain(hq.id);
   });
 
-  it("lists everything when the groups are shown", () => {
-    const result = hideGroupedSidebarThreads({
-      threads,
-      grouped,
-      show: true,
+  it("counts the threads elsewhere that wait on the user", () => {
+    const waitingThreads = [
+      thread("thread-asks", { hasPendingUserInput: true }),
+      thread("thread-approves", { hasPendingApprovals: true }),
+      thread("thread-archived", { hasPendingApprovals: true, archivedAt: "2026-01-01T00:00:00Z" }),
+    ];
+    const placed = new Map(waitingThreads.map((entry) => [rowKey(entry), "Headquarters"] as const));
+    const result = filterSidebarWorkspaceThreads({
+      threads: waitingThreads,
+      workspace: null,
+      workspaceOf: (entry) => placed.get(rowKey(entry)) ?? null,
       openKey: null,
-      delegatedUnderParent: new Set(),
       keyOf: rowKey,
     });
-    expect(result).toEqual({ threads, hidden: 0 });
+    expect(result.threads).toEqual([]);
+    expect([...result.waiting]).toEqual([["Headquarters", 2]]);
+  });
+
+  it("drops a choice naming a group that is gone", () => {
+    const gone = sidebarWorkspaceMembership(
+      new Map([
+        [
+          environmentId,
+          { settings: { threadWorkspaceChoices: { [movedIn.id]: { workspace: "Headquarters" } } } },
+        ],
+      ]),
+      keyOf,
+    );
+    expect(gone.names).toEqual([]);
+    expect(gone.placed.get(rowKey(movedIn))).toBeNull();
+  });
+
+  it("offers the workspaces some of the threads are not in", () => {
+    expect(sidebarWorkspaceMoveTargets([null], ["Headquarters"])).toEqual(["Headquarters"]);
+    expect(sidebarWorkspaceMoveTargets(["Headquarters"], ["Headquarters"])).toEqual([null]);
+    expect(sidebarWorkspaceMoveTargets([null, "Headquarters"], ["Headquarters"])).toEqual([
+      null,
+      "Headquarters",
+    ]);
   });
 });
