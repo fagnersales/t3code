@@ -26,7 +26,51 @@ export type ThreadActionMenuId =
   | "copy-thread"
   | "copy-thread-id"
   | "archive"
-  | "delete";
+  | "delete"
+  | WorkspaceMoveMenuId;
+
+/** Fork: moves to Threads, or to a thread group's workspace. */
+export type WorkspaceMoveMenuId =
+  | "move-workspace"
+  | "move-to-threads"
+  | `move-to-workspace:${string}`;
+
+const WORKSPACE_MOVE_PREFIX = "move-to-workspace:";
+
+/** The workspace a move item goes to, null for Threads; undefined for any other item. */
+export function workspaceOfMoveMenuId(id: string): string | null | undefined {
+  if (id === "move-to-threads") return null;
+  return id.startsWith(WORKSPACE_MOVE_PREFIX) ? id.slice(WORKSPACE_MOVE_PREFIX.length) : undefined;
+}
+
+/**
+ * "Move to Headquarters" or "Move to Threads": one item for one target, a submenu for more.
+ * `count` labels a multi-selection's items.
+ */
+export function buildWorkspaceMoveMenuItem(input: {
+  readonly targets: ReadonlyArray<string | null>;
+  readonly count: number | null;
+  readonly disabled: boolean;
+}): ContextMenuItem<WorkspaceMoveMenuId> | null {
+  const suffix = input.count === null ? "" : ` (${input.count})`;
+  const items = input.targets.map((target): ContextMenuItem<WorkspaceMoveMenuId> => ({
+    id: target === null ? "move-to-threads" : `${WORKSPACE_MOVE_PREFIX}${target}`,
+    label: target ?? "Threads",
+    disabled: input.disabled,
+  }));
+  const [only] = items;
+  if (only === undefined) return null;
+  if (items.length === 1) {
+    return { ...only, label: `Move to ${only.label}${suffix}`, icon: "arrow-right-left" };
+  }
+  return {
+    id: "move-workspace",
+    label: `Move to workspace${suffix}`,
+    icon: "arrow-right-left",
+    disabled: input.disabled,
+    children: items,
+  };
+}
 
 export type DraftActionMenuId =
   | "copy"
@@ -93,21 +137,27 @@ export interface ThreadActionMenuState {
   readonly canShareWithGuest?: boolean;
   /** A No project thread with its own folder, on a server that can promote it. */
   readonly canTurnIntoProject?: boolean;
+  /** Fork: the workspace move item; null when no thread group exists. */
+  readonly workspaceMove?: ContextMenuItem<WorkspaceMoveMenuId> | null;
 }
 
 /** Local navigation, read markers, and copying remain available to read-only clients. */
 export function threadActionRequiresOperate(action: ThreadActionMenuId): boolean {
-  return ![
-    "new-thread-on-branch",
-    "project-settings",
-    "mark-unread",
-    "share-guest",
-    "copy",
-    "copy-path",
-    "copy-branch",
-    "copy-thread",
-    "copy-thread-id",
-  ].includes(action);
+  return (
+    ![
+      "new-thread-on-branch",
+      "project-settings",
+      "mark-unread",
+      "share-guest",
+      "copy",
+      "copy-path",
+      "copy-branch",
+      "copy-thread",
+      "copy-thread-id",
+      // Moves write the settings, so the caller checks settings:write.
+      "move-workspace",
+    ].includes(action) && workspaceOfMoveMenuId(action) === undefined
+  );
 }
 
 export function buildThreadActionMenuItems(
@@ -186,6 +236,7 @@ export function buildThreadActionMenuItems(
           },
         ]
       : []),
+    ...(state.workspaceMove ? [state.workspaceMove] : []),
     ...(state.canTurnIntoProject
       ? [
           {

@@ -155,6 +155,7 @@ import * as ThreadFeedHttp from "./threadFeed/http.ts";
 import * as ProjectFeed from "./projectFeed/ProjectFeed.ts";
 import * as ProjectFeedHttp from "./projectFeed/http.ts";
 import * as ThreadGroupsHttp from "./threadGroups/http.ts";
+import * as ThreadWorkspaces from "./threadGroups/workspaces.ts";
 import * as ThreadOffload from "./threadOffload/ThreadOffload.ts";
 import * as ThreadOffloadHttp from "./threadOffload/http.ts";
 import * as CloudLink from "./cloud/CloudLink.ts";
@@ -592,6 +593,7 @@ const layerProviderInstallationRefresh = Layer.effectDiscard(
 );
 
 const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
+  ThreadWorkspaces.prunerLayer,
   AgentAwarenessRelay.layer,
   HeldHooksWaker.layer,
   layerThreadSettlementWorker,
@@ -746,6 +748,7 @@ const layerMakeRoutes = Layer.mergeAll(
     ThreadFeedHttp.layer.pipe(Layer.provide(ThreadFeed.layer)),
     ProjectFeedHttp.layer.pipe(Layer.provide(ProjectFeed.layer)),
     ThreadGroupsHttp.layer,
+    ThreadWorkspaces.routesLayer,
     ThreadOffloadHttp.layer,
     DeviceHubProxy.layer,
     ServerBrowserStream.routeLayer,

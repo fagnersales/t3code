@@ -15,10 +15,21 @@ Fagner's T3 Code: the Nightly he ran, plus live thread and project feeds for Hea
 - **Project feed:** `t3 project follow` and `GET /api/project-feed/v1`, a project's threads live
   (created, running, waiting, settled, archived, deleted), see [project-feed.md](project-feed.md).
 - **Thread groups:** `t3 thread group <name> <thread>…` (and `POST /api/thread-groups/v1`) sets
-  the threads of a named group in the server settings' `threadGroups`. The sidebar hides them
-  until the eye button in its header shows them; the open thread always stays listed.
-  Headquarters keeps its group, `Headquarters`, equal to the threads it follows. A settings key,
-  not a migration: an older build ignores it.
+  the threads of a named group in the server settings' `threadGroups`; each call replaces the
+  group's list. Headquarters keeps its group, `Headquarters`, equal to the threads it follows.
+- **Workspaces:** each thread group is a sidebar workspace beside Threads (every other thread).
+  The switch in the sidebar header flips between them (a menu when there are several groups),
+  remembered per window, with a badge counting threads in another workspace that wait on an
+  approval or a question. The open thread always stays listed, and search looks in every
+  workspace. A thread moved by hand ("Move to Headquarters" / "Move to Threads" in the thread
+  menu, also for a selection, or `t3 thread workspace <name|threads> <thread>…`) is kept in
+  `threadWorkspaceChoices`, which wins over the group both ways and which `t3 thread group` never
+  touches. `t3 thread workspace` lists every workspace, `--reset` forgets a move. A thread the
+  user starts while a workspace is shown joins it, and a subagent, delegated task or fork follows
+  its parent; a top-level thread an agent launches does not (the launcher is only in its first
+  message). The server drops the move of a deleted thread, and at start of any thread it no
+  longer has (offloaded ones too). Thread offload still keeps only `threadGroups` threads. Both are
+  settings keys, not migrations: an older build ignores them.
 - **Thread offload:** `t3 thread offload` moves threads idle for 7+ days, with their subagents
   and forks, out of the database into compressed files under `~/.t3/offload/`; `t3 thread restore`
   puts one back exactly and keeps the bundle (`t3 thread prune-restored` deletes old ones). Runs

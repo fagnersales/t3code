@@ -1148,6 +1148,15 @@ export type StorageCleanupSettings = typeof StorageCleanupSettings.Type;
 export const ThreadGroups = Schema.Record(TrimmedNonEmptyString, Schema.Array(ThreadId));
 export type ThreadGroups = typeof ThreadGroups.Type;
 
+/** Fork: the workspace a user put a thread in by hand; null is Threads, the default one. */
+export const ThreadWorkspaceChoice = Schema.Struct({
+  workspace: Schema.NullOr(TrimmedNonEmptyString),
+});
+export type ThreadWorkspaceChoice = typeof ThreadWorkspaceChoice.Type;
+
+export const ThreadWorkspaceChoices = Schema.Record(ThreadId, ThreadWorkspaceChoice);
+export type ThreadWorkspaceChoices = typeof ThreadWorkspaceChoices.Type;
+
 export const ServerSettings = Schema.Struct({
   // Null means unmigrated; empty is authoritative and must not resurrect cleared preferences.
   favorites: Schema.NullOr(ModelFavorites).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
@@ -1333,6 +1342,14 @@ export const ServerSettings = Schema.Struct({
    * a set's threads until the user shows that set. Written by `t3 thread group`.
    */
   threadGroups: ThreadGroups.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
+
+  /**
+   * Fork: threads the user moved by hand, which win over `threadGroups` both ways. A group names a
+   * sidebar workspace; `t3 thread group` never writes here, so Headquarters cannot undo a move.
+   */
+  threadWorkspaceChoices: ThreadWorkspaceChoices.pipe(
+    Schema.withDecodingDefault(Effect.succeed({})),
+  ),
 });
 export type ServerSettings = typeof ServerSettings.Type;
 
@@ -1647,6 +1664,10 @@ export const ServerSettingsPatch = Schema.Struct({
   // A group's list replaces the saved one; null removes the group.
   threadGroups: Schema.optionalKey(
     Schema.Record(TrimmedNonEmptyString, Schema.NullOr(Schema.Array(ThreadId))),
+  ),
+  // Per thread; null forgets the choice, so the thread follows `threadGroups` again.
+  threadWorkspaceChoices: Schema.optionalKey(
+    Schema.Record(ThreadId, Schema.NullOr(ThreadWorkspaceChoice)),
   ),
 });
 export type ServerSettingsPatch = typeof ServerSettingsPatch.Type;

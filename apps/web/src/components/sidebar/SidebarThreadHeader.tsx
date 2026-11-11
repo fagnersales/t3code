@@ -16,8 +16,8 @@ export interface SidebarThreadHeaderProps {
   searchFieldRef?: RefObject<HTMLDivElement | null>;
   hasProjects: boolean;
   projectScope: ReactNode;
-  /** Fork: shows or hides the threads of `threadGroups`; null when there are none. */
-  threadGroupsToggle?: ReactNode;
+  /** Fork: switches between Threads and each thread group's workspace; null when no group exists. */
+  workspaceSwitch?: ReactNode;
   onNewProject: () => void;
   onNewThread: (event: ReactMouseEvent) => void;
   newThreadDisabled: boolean;
@@ -38,7 +38,7 @@ export function SidebarThreadHeader({
   searchFieldRef,
   hasProjects,
   projectScope,
-  threadGroupsToggle = null,
+  workspaceSwitch = null,
   onNewProject,
   onNewThread,
   newThreadDisabled,
@@ -105,7 +105,7 @@ export function SidebarThreadHeader({
         ) : null}
       </div>
       <div className="flex shrink-0 items-center">
-        {threadGroupsToggle}
+        {workspaceSwitch}
         {hasProjects ? (
           <>
             {projectScope}
@@ -152,7 +152,7 @@ export function SidebarHeaderIconButton({
   children?: ReactNode;
 } & Omit<
   ComponentProps<typeof SidebarMenuButton>,
-  "children" | "className" | "tooltip" | "isActive" | "aria-label"
+  "children" | "className" | "tooltip" | "aria-label"
 >) {
   return (
     <Tooltip>

@@ -16,7 +16,7 @@ import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http";
 import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
 import * as ServerConfig from "../config.ts";
 import { readPersistedServerRuntimeState } from "../serverRuntimeState.ts";
-import { projectLocationFlags, resolveCliAuthConfig } from "./config.ts";
+import { type CliAuthLocationFlags, projectLocationFlags, resolveCliAuthConfig } from "./config.ts";
 
 export class ThreadGroupError extends Schema.TaggedError<ThreadGroupError>()("ThreadGroupError", {
   detail: Schema.String,
@@ -29,6 +29,74 @@ export class ThreadGroupError extends Schema.TaggedError<ThreadGroupError>()("Th
 const decodeResponse = Schema.decodeUnknownEffect(ThreadGroupsResponse);
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(ThreadGroupsResponse));
 const isThreadGroupError = Schema.is(ThreadGroupError);
+
+/**
+ * Calls a fork route of the running server with a session made for the call: a GET without a
+ * body, a POST (which needs settings:write) with one.
+ */
+export const callThreadGroupsServer = Effect.fn("cli.callThreadGroupsServer")(function* <A>(
+  flags: CliAuthLocationFlags,
+  input: {
+    readonly label: string;
+    readonly route: string;
+    readonly body: Option.Option<unknown>;
+    readonly decode: (body: unknown) => Effect.Effect<A, Schema.SchemaError>;
+  },
+) {
+  const writes = Option.isSome(input.body);
+  const logLevel = yield* GlobalFlag.LogLevel;
+  const config = yield* resolveCliAuthConfig(flags, logLevel);
+  return yield* Effect.gen(function* () {
+    const runtimeState = yield* readPersistedServerRuntimeState(config.serverRuntimeStatePath);
+    if (Option.isNone(runtimeState)) {
+      return yield* new ThreadGroupError({
+        detail: `No running T3 Code server uses ${config.baseDir}. Start T3 Code, then retry.`,
+      });
+    }
+    const environmentAuth = yield* EnvironmentAuth.EnvironmentAuth;
+    const issued = yield* Effect.acquireRelease(
+      environmentAuth.issueSession({
+        label: input.label,
+        scopes: [writes ? AuthSettingsWriteScope : AuthOrchestrationReadScope],
+      }),
+      (session) =>
+        environmentAuth.revokeSession(session.sessionId).pipe(Effect.ignore({ log: true })),
+    );
+    const url = new URL(input.route, runtimeState.value.origin);
+    const request = Option.match(input.body, {
+      onNone: () => HttpClientRequest.get(url),
+      onSome: (body) => HttpClientRequest.post(url).pipe(HttpClientRequest.bodyJsonUnsafe(body)),
+    });
+    const response = yield* HttpClient.execute(
+      request.pipe(HttpClientRequest.bearerToken(issued.token)),
+    );
+    const body = yield* response.json;
+    if (response.status !== 200) {
+      const said =
+        typeof body === "object" && body !== null && "message" in body
+          ? String(body.message)
+          : `status ${response.status}`;
+      return yield* new ThreadGroupError({ detail: `The server refused: ${said}` });
+    }
+    return yield* input.decode(body);
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(
+      Layer.merge(
+        EnvironmentAuth.layerRuntime.pipe(
+          Layer.provide(ServerConfig.layer(config)),
+          Layer.provide(Layer.succeed(References.MinimumLogLevel, config.logLevel)),
+        ),
+        FetchHttpClient.layer,
+      ),
+    ),
+    Effect.mapError((error) =>
+      isThreadGroupError(error)
+        ? error
+        : new ThreadGroupError({ detail: `Could not reach T3 Code: ${String(error)}` }),
+    ),
+  );
+});
 
 const groupCommand = Command.make("group", {
   ...projectLocationFlags,
@@ -58,59 +126,12 @@ const groupCommand = Command.make("group", {
         return yield* new ThreadGroupError({ detail: "Pass threads or --clear, not both." });
       }
       const writes = flags.clear || threadIds.length > 0;
-      const logLevel = yield* GlobalFlag.LogLevel;
-      const config = yield* resolveCliAuthConfig(flags, logLevel);
-      const groups = yield* Effect.gen(function* () {
-        const runtimeState = yield* readPersistedServerRuntimeState(config.serverRuntimeStatePath);
-        if (Option.isNone(runtimeState)) {
-          return yield* new ThreadGroupError({
-            detail: `No running T3 Code server uses ${config.baseDir}. Start T3 Code, then retry.`,
-          });
-        }
-        const environmentAuth = yield* EnvironmentAuth.EnvironmentAuth;
-        const issued = yield* Effect.acquireRelease(
-          environmentAuth.issueSession({
-            label: "t3 thread group",
-            scopes: [writes ? AuthSettingsWriteScope : AuthOrchestrationReadScope],
-          }),
-          (session) =>
-            environmentAuth.revokeSession(session.sessionId).pipe(Effect.ignore({ log: true })),
-        );
-        const url = new URL(THREAD_GROUPS_ROUTE, runtimeState.value.origin);
-        const request = writes
-          ? HttpClientRequest.post(url).pipe(
-              HttpClientRequest.bodyJsonUnsafe({ group: flags.group, threadIds }),
-            )
-          : HttpClientRequest.get(url);
-        const response = yield* HttpClient.execute(
-          request.pipe(HttpClientRequest.bearerToken(issued.token)),
-        );
-        const body = yield* response.json;
-        if (response.status !== 200) {
-          const said =
-            typeof body === "object" && body !== null && "message" in body
-              ? String(body.message)
-              : `status ${response.status}`;
-          return yield* new ThreadGroupError({ detail: `The server refused: ${said}` });
-        }
-        return (yield* decodeResponse(body)).groups;
-      }).pipe(
-        Effect.scoped,
-        Effect.provide(
-          Layer.merge(
-            EnvironmentAuth.layerRuntime.pipe(
-              Layer.provide(ServerConfig.layer(config)),
-              Layer.provide(Layer.succeed(References.MinimumLogLevel, config.logLevel)),
-            ),
-            FetchHttpClient.layer,
-          ),
-        ),
-        Effect.mapError((error) =>
-          isThreadGroupError(error)
-            ? error
-            : new ThreadGroupError({ detail: `Could not reach T3 Code: ${String(error)}` }),
-        ),
-      );
+      const { groups } = yield* callThreadGroupsServer(flags, {
+        label: "t3 thread group",
+        route: THREAD_GROUPS_ROUTE,
+        body: writes ? Option.some({ group: flags.group, threadIds }) : Option.none(),
+        decode: decodeResponse,
+      });
       if (flags.json) return yield* Console.log(encodeJson({ groups }));
       const members = groups[flags.group] ?? [];
       yield* Console.log(

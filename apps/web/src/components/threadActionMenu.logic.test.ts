@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { buildThreadActionMenuItems, type ThreadActionMenuState } from "./threadActionMenu.logic";
+import {
+  buildThreadActionMenuItems,
+  buildWorkspaceMoveMenuItem,
+  threadActionRequiresOperate,
+  type ThreadActionMenuState,
+  workspaceOfMoveMenuId,
+} from "./threadActionMenu.logic";
 
 const baseState: ThreadActionMenuState = {
   canOperate: true,
@@ -73,5 +79,37 @@ describe("buildThreadActionMenuItems", () => {
     });
     expect(items.find((item) => item.id === "archive")?.disabled).toBe(true);
     expect(items.find((item) => item.id === "turn-into-project")?.disabled).toBe(true);
+  });
+});
+
+describe("workspace move items", () => {
+  it("names the one target and maps the item back to it", () => {
+    const toHq = buildWorkspaceMoveMenuItem({
+      targets: ["Headquarters"],
+      count: null,
+      disabled: false,
+    });
+    expect(toHq).toMatchObject({ label: "Move to Headquarters" });
+    expect(workspaceOfMoveMenuId(toHq!.id)).toBe("Headquarters");
+    const back = buildWorkspaceMoveMenuItem({ targets: [null], count: 3, disabled: false });
+    expect(back).toMatchObject({ id: "move-to-threads", label: "Move to Threads (3)" });
+    expect(workspaceOfMoveMenuId(back!.id)).toBeNull();
+  });
+
+  it("nests several targets and offers nothing without one", () => {
+    const item = buildWorkspaceMoveMenuItem({
+      targets: [null, "Headquarters"],
+      count: 2,
+      disabled: true,
+    });
+    expect(item?.label).toBe("Move to workspace (2)");
+    expect(workspaceOfMoveMenuId(item!.id)).toBeUndefined();
+    expect(item?.children?.map((child) => child.label)).toEqual(["Threads", "Headquarters"]);
+    expect(buildWorkspaceMoveMenuItem({ targets: [], count: null, disabled: false })).toBeNull();
+  });
+
+  it("leaves the settings scope check to the caller", () => {
+    expect(threadActionRequiresOperate("move-to-threads")).toBe(false);
+    expect(threadActionRequiresOperate("move-to-workspace:Headquarters")).toBe(false);
   });
 });
