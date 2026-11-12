@@ -700,6 +700,12 @@ const threadStartCommand = Command.make("start", {
     Flag.withDescription("Model slug. Defaults to the project's default model."),
     Flag.optional,
   ),
+  effort: Flag.String("effort").pipe(
+    Flag.withDescription(
+      "The model's effort option, such as medium. Pass with --model. Defaults to the provider's own.",
+    ),
+    Flag.optional,
+  ),
   worktree: Flag.String("worktree").pipe(
     Flag.withDescription(
       "Run in a new git worktree based on this branch, tag, or commit, instead of the project folder.",
@@ -721,6 +727,9 @@ const threadStartCommand = Command.make("start", {
       if (Option.isSome(flags.provider) !== Option.isSome(flags.model)) {
         return yield* new ThreadUsageError({ detail: "--provider and --model go together." });
       }
+      if (Option.isSome(flags.effort) && Option.isNone(flags.model)) {
+        return yield* new ThreadUsageError({ detail: "--effort needs --provider and --model." });
+      }
       const title = yield* decodeTitle(
         Option.getOrElse(flags.title, () => titleFromMessage(message)),
       ).pipe(Effect.mapError(() => new ThreadUsageError({ detail: "The title is empty." })));
@@ -740,6 +749,9 @@ const threadStartCommand = Command.make("start", {
                     modelSelection: {
                       instanceId: flags.provider.value,
                       model: flags.model.value,
+                      ...(Option.isSome(flags.effort)
+                        ? { options: [{ id: "effort", value: flags.effort.value }] }
+                        : {}),
                     },
                   }
                 : {}),

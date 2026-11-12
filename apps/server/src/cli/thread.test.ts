@@ -79,6 +79,7 @@ it.effect(
           port: 3_773,
         }),
       });
+      const launches: Array<unknown> = [];
       using _session = vi.spyOn(McpBridge, "mcpToolSession").mockReturnValue(
         Effect.succeed({
           call: (tool, args) => {
@@ -86,6 +87,7 @@ it.effect(
               case "t3_project_list":
                 return Effect.succeed({ structuredContent: { projects, nextCursor: null } });
               case "t3_thread_launch":
+                launches.push(args);
                 return Effect.succeed({
                   structuredContent: { threadId, projectId: args.projectId, runId: null },
                 });
@@ -124,6 +126,28 @@ it.effect(
           identifier,
         );
       }
+
+      yield* Command.runWith(threadCommand, { version: "0.0.0" })([
+        "start",
+        "intended-project",
+        "Inspect this project",
+        "--provider",
+        "claude_proxy",
+        "--model",
+        "claude-fable-5-2",
+        "--effort",
+        "medium",
+        "--base-dir",
+        baseDir,
+      ]).pipe(
+        Effect.provideService(HostProcess.HomeDirectory, home),
+        Effect.provideService(HostProcess.WorkingDirectory, cwd),
+      );
+      assert.deepStrictEqual((launches.at(-1) as { modelSelection?: unknown }).modelSelection, {
+        instanceId: "claude_proxy",
+        model: "claude-fable-5-2",
+        options: [{ id: "effort", value: "medium" }],
+      });
     }).pipe(
       Effect.scoped,
       Effect.provide(
