@@ -22,6 +22,7 @@ import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
+import { EVENT_LOG_PRUNED_THROUGH } from "../persistence/OrchestrationEventStore.ts";
 
 /** Tool input and output are previews; the full text stays readable through `t3 thread show`. */
 const TOOL_TEXT_LIMIT = 4_000;
@@ -367,6 +368,14 @@ export const make = Effect.fn("ThreadFeed.make")(function* (source: ThreadFeedSo
     return rows[0] === undefined ? undefined : yield* decodeItem(rows[0].payload_json);
   });
 
+  // The server prunes events the projections cover once they are a day old, keeping only each
+  // thread's newest, so a replay from below this boundary would miss changes.
+  const prunedThrough = sql<{ last_sequence: number }>`
+    SELECT last_sequence FROM orchestration_v2_projection_metadata
+    WHERE projection_name = ${EVENT_LOG_PRUNED_THROUGH}`.pipe(
+    Effect.map((rows) => rows[0]?.last_sequence ?? 0),
+  );
+
   const readState = Effect.fn("ThreadFeed.readState")(function* (threadId: ThreadId) {
     const threadRows = yield* sql<{ title: string; archived_at: string | null }>`
       SELECT title, archived_at FROM orchestration_v2_projection_threads
@@ -424,9 +433,14 @@ export const make = Effect.fn("ThreadFeed.make")(function* (source: ThreadFeedSo
           lastPosition = input.after ?? head;
           return Stream.succeed(errorEvent(`No thread ${threadId} on this server.`));
         }
+        // A position whose events were pruned starts over as a fresh follow with the longest tail.
+        const after =
+          input.after !== undefined && input.after < (yield* prunedThrough)
+            ? undefined
+            : input.after;
+        const tail = after === input.after ? (input.tail ?? 0) : MAX_TAIL_ITEMS;
         const translator = makeThreadFeedTranslator(threadId);
-        const tailItems =
-          input.after === undefined ? yield* readTail(threadId, input.tail ?? 0) : [];
+        const tailItems = after === undefined ? yield* readTail(threadId, tail) : [];
         translator.seed({ items: tailItems });
         const tailEvents = tailItems.map((item): ThreadFeedEvent => ({
           v: THREAD_FEED_VERSION,
@@ -454,7 +468,7 @@ export const make = Effect.fn("ThreadFeed.make")(function* (source: ThreadFeedSo
           };
           return [ready];
         });
-        const start = input.after ?? head;
+        const start = after ?? head;
         const caughtUp = start >= head;
         let readySent = caughtUp;
         const initialReady = caughtUp ? yield* readyEvents(false) : [];

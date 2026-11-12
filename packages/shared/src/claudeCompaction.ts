@@ -16,7 +16,7 @@ export function formatClaudeResumeCompactionQuestion(input: {
 const CLAUDE_RESUME_COMPACTION_QUESTION_PATTERN =
   /^This session is (\d+h \d+m|\d+m) old and uses \d{1,3}(?:,\d{3})* tokens\. Compact it before continuing\?$/u;
 
-function isClaudeResumeCompactionQuestion(question: string): boolean {
+export function isClaudeResumeCompactionQuestion(question: string): boolean {
   return CLAUDE_RESUME_COMPACTION_QUESTION_PATTERN.test(question);
 }
 
@@ -48,7 +48,9 @@ export const COMPACTION_SUGGESTION_MIN_TOKENS = 200_000;
 /** Prompt cache lifetime assumed when Claude reports none: its 1h cache plus slack. */
 const CLAUDE_RESUME_COMPACTION_FALLBACK_MS = 70 * 60_000;
 
-const COMPACT_COMMAND_PATTERN = /^\/compact(?:\s|$)/i;
+// A typed `/compact`, with or without instructions, is already the compaction. Queueing a
+// bare one ahead of it would run an uninstructed compaction first and charge for two.
+export const COMPACT_COMMAND_PATTERN = /^\/compact(?:\s|$)/i;
 
 /** A message that is itself a compaction, so nothing should compact before it. */
 export function isCompactCommand(text: string): boolean {

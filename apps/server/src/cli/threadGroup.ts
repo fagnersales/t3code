@@ -15,7 +15,7 @@ import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http";
 
 import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
 import * as ServerConfig from "../config.ts";
-import { readPersistedServerRuntimeState } from "../serverRuntimeState.ts";
+import { readLiveServerRuntimeState } from "../serverRuntimeState.ts";
 import { type CliAuthLocationFlags, projectLocationFlags, resolveCliAuthConfig } from "./config.ts";
 
 export class ThreadGroupError extends Schema.TaggedError<ThreadGroupError>()("ThreadGroupError", {
@@ -47,7 +47,7 @@ export const callThreadGroupsServer = Effect.fn("cli.callThreadGroupsServer")(fu
   const logLevel = yield* GlobalFlag.LogLevel;
   const config = yield* resolveCliAuthConfig(flags, logLevel);
   return yield* Effect.gen(function* () {
-    const runtimeState = yield* readPersistedServerRuntimeState(config.serverRuntimeStatePath);
+    const runtimeState = yield* readLiveServerRuntimeState(config.serverRuntimeStatePath);
     if (Option.isNone(runtimeState)) {
       return yield* new ThreadGroupError({
         detail: `No running T3 Code server uses ${config.baseDir}. Start T3 Code, then retry.`,
