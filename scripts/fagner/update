@@ -77,3 +77,4 @@ if [ "$build" = 1 ]; then
   "$FAGNER_REPO_ROOT/scripts/fagner/build"
 fi
 log "update finished. Install with: scripts/fagner/install --quit"
+log "The Linux PCs take every update too: scripts/fagner/linux deploy"

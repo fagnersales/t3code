@@ -1,42 +1,114 @@
 #!/bin/bash
-# Build and install the fork on a Linux PC (x64) from this Mac, over ssh.
+# Build and install the fork on the Linux PCs (x64) from this Mac, over ssh.
 #
-#   scripts/fagner/linux build [--version V]   build this checkout's commit on the PC
+#   scripts/fagner/linux build [--version V]   build this checkout's commit on the build PC and
+#                                              copy the build to the other PCs
 #   scripts/fagner/linux install --quit [--version V] [--force]
-#                                              make it the T3 the PC opens; refuses while a thread
-#                                              there is busy, unless --force
-#   scripts/fagner/linux rollback --quit [--force]   back to the PC's Nightly
+#                                              make it the T3 each PC opens; a PC refuses while a
+#                                              thread there is busy, unless --force
+#   scripts/fagner/linux rollback --quit [--force] [--restore-database DIR]
+#                                              back to a PC's Nightly
 #   scripts/fagner/linux status [--threads]    what runs there, and its threads
 #   scripts/fagner/linux deploy [--force]      build, then install --quit
 #
-# The PC is $T3_FAGNER_LINUX_HOST (default acer@omarchy-acer). The build runs there (node-pty and
-# the libsecret helper must be compiled on Linux) and takes the same version as the Mac build of the
-# same app sources. install and rollback detach on the PC and log to
-# ~/.local/state/t3code-fagner/ there.
+#   --on HOST   only that PC (any command; rollback requires it)
+#
+# The build PC is $T3_FAGNER_LINUX_HOST (default acer@omarchy-acer): the build runs there (node-pty
+# and the libsecret helper must be compiled on Linux) and takes the same version as the Mac build
+# of the same app sources. $T3_FAGNER_LINUX_COPIES (default "filipe", the Lenovo) are PCs that
+# only receive that build. install and rollback detach on each PC and log to
+# ~/.local/state/t3code-fagner/ there. A PC that is off or refuses does not stop the others; the
+# command then ends with an error naming it.
 set -euo pipefail
 source "$(dirname "$0")/lib.sh"
 
-HOST="${T3_FAGNER_LINUX_HOST:-acer@omarchy-acer}"
+BUILD_HOST="${T3_FAGNER_LINUX_HOST:-acer@omarchy-acer}"
+COPY_HOSTS="${T3_FAGNER_LINUX_COPIES-filipe}"
 REMOTE_SCRIPTS=".local/share/t3code-fagner/scripts"
 REMOTE_CACHE=".cache/t3code-fagner"
 
-remote() { ssh -o BatchMode=yes "$HOST" "$@"; }
+remote() {
+  local host="$1"
+  shift
+  ssh -o BatchMode=yes -o ConnectTimeout=10 "$host" "$@"
+}
 
 # The PC runs the scripts of this checkout.
 sync_scripts() {
-  remote "mkdir -p $REMOTE_SCRIPTS"
-  rsync -a --delete "$FAGNER_REPO_ROOT/scripts/fagner/linux-host/" "$HOST:$REMOTE_SCRIPTS/"
+  local host="$1"
+  remote "$host" "mkdir -p $REMOTE_SCRIPTS"
+  rsync -a --delete "$FAGNER_REPO_ROOT/scripts/fagner/linux-host/" "$host:$REMOTE_SCRIPTS/"
 }
 
 run_remote() {
-  local script="$1" arg quoted=""
-  shift
+  local host="$1" script="$2" arg quoted=""
+  shift 2
   for arg in "$@"; do quoted="$quoted $(printf '%q' "$arg")"; done
-  remote "bash $REMOTE_SCRIPTS/$script$quoted"
+  remote "$host" "bash $REMOTE_SCRIPTS/$script$quoted"
+}
+
+# Run a function for each chosen PC. One that fails is named at the end and the rest still run.
+each_host() {
+  local host failed=""
+  for host in $HOSTS; do
+    log "== $host"
+    if ! "$@" "$host"; then failed="$failed $host"; fi
+  done
+  [ -z "$failed" ] || die "Not done on:$failed. Run again with --on HOST when it is ready."
+}
+
+build_on_build_host() {
+  local version="$1" head="$2" have bundle_dir bundle
+  if remote "$BUILD_HOST" "test -d $REMOTE_CACHE/builds/$version/app"; then
+    log "$BUILD_HOST already has the Linux build $version."
+    return 0
+  fi
+  log "Linux build of $version from $(git rev-parse --short=10 HEAD) on $BUILD_HOST"
+  sync_scripts "$BUILD_HOST"
+
+  # Send only the commits the PC lacks: the whole history is about 800 MB.
+  bundle_dir="$(mktemp -d)"
+  bundle="$bundle_dir/src.bundle"
+  have="$(remote "$BUILD_HOST" "git -C $REMOTE_CACHE/repo rev-parse -q --verify HEAD 2>/dev/null" || true)"
+  if remote "$BUILD_HOST" "git -C $REMOTE_CACHE/repo cat-file -e $head^{commit} 2>/dev/null"; then
+    bundle=""
+  elif [ -n "$have" ] && git cat-file -e "$have^{commit}" 2>/dev/null; then
+    git bundle create -q "$bundle" HEAD "^$have"
+  else
+    git bundle create -q "$bundle" HEAD
+  fi
+  if [ -n "$bundle" ]; then
+    log "Sending $(du -h "$bundle" | cut -f1) of git objects..."
+    remote "$BUILD_HOST" "mkdir -p $REMOTE_CACHE"
+    rsync -a "$bundle" "$BUILD_HOST:$REMOTE_CACHE/src.bundle"
+    run_remote "$BUILD_HOST" build --version "$version" --commit "$head" --bundle "$REMOTE_CACHE/src.bundle"
+  else
+    run_remote "$BUILD_HOST" build --version "$version" --commit "$head"
+  fi
+  rm -rf "$bundle_dir"
+}
+
+# Copy the build from the build PC to another one, through this Mac (the PCs hold no keys for each
+# other), and check it runs there: its C library may be older than the build PC's.
+copy_build() {
+  local version="$1" host="$2" dir="$REMOTE_CACHE/builds/$version"
+  if remote "$host" "test -d $dir/app"; then
+    log "$host already has the Linux build $version."
+    return 0
+  fi
+  log "Copying the Linux build $version from $BUILD_HOST to $host..."
+  remote "$host" "rm -rf $dir.partial && mkdir -p $dir.partial" || return 1
+  remote "$BUILD_HOST" "tar -C $dir -cf - app commit" | remote "$host" "tar -C $dir.partial -xf -" || return 1
+  remote "$host" "set -e
+    app=$dir.partial/app
+    ELECTRON_RUN_AS_NODE=1 \$app/t3code \$app/resources/app.asar/apps/server/dist/bin.mjs --version
+    ELECTRON_RUN_AS_NODE=1 \$app/t3code \$app/resources/app.asar/apps/server/dist/bin.mjs thread follow --help >/dev/null
+    mv $dir.partial $dir
+    ln -sfn $version $REMOTE_CACHE/builds/latest"
 }
 
 build() {
-  local version="" head have bundle_dir bundle
+  local version="" head host reached=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --version) version="$2"; shift ;;
@@ -49,54 +121,68 @@ build() {
   # The PC builds the commit, so uncommitted app changes would be left out.
   same_app_sources "$head" || die "The app sources have uncommitted changes; commit them first."
   [ -n "$version" ] || version="$(version_for_checkout)"
-  if remote "test -d $REMOTE_CACHE/builds/$version/app"; then
-    log "$HOST already has the Linux build $version."
-    return 0
-  fi
-  log "Linux build of $version from $(git rev-parse --short=10 HEAD) on $HOST"
-  sync_scripts
-
-  # Send only the commits the PC lacks: the whole history is about 800 MB.
-  bundle_dir="$(mktemp -d)"
-  bundle="$bundle_dir/src.bundle"
-  have="$(remote "git -C $REMOTE_CACHE/repo rev-parse -q --verify HEAD 2>/dev/null" || true)"
-  if remote "git -C $REMOTE_CACHE/repo cat-file -e $head^{commit} 2>/dev/null"; then
-    bundle=""
-  elif [ -n "$have" ] && git cat-file -e "$have^{commit}" 2>/dev/null; then
-    git bundle create -q "$bundle" HEAD "^$have"
-  else
-    git bundle create -q "$bundle" HEAD
-  fi
-  if [ -n "$bundle" ]; then
-    log "Sending $(du -h "$bundle" | cut -f1) of git objects..."
-    remote "mkdir -p $REMOTE_CACHE"
-    rsync -a "$bundle" "$HOST:$REMOTE_CACHE/src.bundle"
-    run_remote build --version "$version" --commit "$head" --bundle "$REMOTE_CACHE/src.bundle"
-  else
-    run_remote build --version "$version" --commit "$head"
-  fi
-  rm -rf "$bundle_dir"
+  build_on_build_host "$version" "$head"
 
   # The Mac build of these sources takes the same version from this folder.
   mkdir -p "$FAGNER_BUILDS_DIR/$version"
   echo "$head" >"$FAGNER_BUILDS_DIR/$version/commit"
-  echo "$HOST:$REMOTE_CACHE/builds/$version" >"$FAGNER_BUILDS_DIR/$version/linux-x64"
-  log "Linux build $version is on $HOST. Install with: scripts/fagner/linux install --quit"
+  echo "$BUILD_HOST:$REMOTE_CACHE/builds/$version" >"$FAGNER_BUILDS_DIR/$version/linux-x64"
+
+  for host in $HOSTS; do
+    [ "$host" = "$BUILD_HOST" ] && continue
+    if copy_build "$version" "$host"; then reached="$reached $host"; else WITHOUT_BUILD="$WITHOUT_BUILD $host"; fi
+  done
+  log "Linux build $version is on: $BUILD_HOST$reached. Install with: scripts/fagner/linux install --quit"
+}
+
+# After a build: stop on the PCs it did not reach (off, or the build does not run there).
+require_build_everywhere() {
+  [ -z "$WITHOUT_BUILD" ] || die "The build did not reach:$WITHOUT_BUILD. Run again with --on HOST when it is on."
+}
+
+on_host() {
+  local script="$1" host
+  shift
+  host="${*: -1}"
+  set -- "${@:1:$#-1}"
+  sync_scripts "$host" && run_remote "$host" "$script" "$@"
 }
 
 command="${1:-}"
 [ $# -gt 0 ] && shift
+HOSTS="$BUILD_HOST $COPY_HOSTS"
+chosen=0
+args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --on) HOSTS="$2"; chosen=1; shift ;;
+    *) args+=("$1") ;;
+  esac
+  shift
+done
+set -- "${args[@]+"${args[@]}"}"
+
+WITHOUT_BUILD=""
 case "$command" in
-  build) build "$@" ;;
-  install | rollback | status)
-    sync_scripts
-    run_remote "$command" "$@"
+  build)
+    build "$@"
+    require_build_everywhere
+    ;;
+  install | status) each_host on_host "$command" "$@" ;;
+  rollback)
+    [ "$chosen" = 1 ] || die "rollback takes --on HOST: each PC goes back on its own."
+    each_host on_host rollback "$@"
     ;;
   deploy)
     build
-    sync_scripts
-    run_remote install --quit "$@"
+    with_build=""
+    for host in $HOSTS; do
+      case " $WITHOUT_BUILD " in *" $host "*) ;; *) with_build="$with_build $host" ;; esac
+    done
+    HOSTS="$with_build"
+    each_host on_host install --quit "$@"
+    require_build_everywhere
     ;;
-  -h | --help | "") sed -n '2,16p' "$0" ;;
+  -h | --help | "") sed -n '2,22p' "$0" ;;
   *) die "Unknown command $command" ;;
 esac
