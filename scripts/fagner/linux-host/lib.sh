@@ -1,16 +1,35 @@
 # Shared by scripts/fagner/linux-host/*, which run on the Linux PC (scripts/fagner/linux copies
-# them to ~/.local/share/t3code-fagner/scripts there). Bash, GNU userland, a Hyprland session.
+# them to ~/.local/share/t3code-fagner/scripts there). Bash, GNU userland, a Wayland session
+# (Hyprland on the Acer, GNOME on the Lenovo).
 # shellcheck shell=bash
 
 FAGNER_CACHE="${T3_FAGNER_CACHE:-$HOME/.cache/t3code-fagner}"
 FAGNER_SRC="$FAGNER_CACHE/repo"
 FAGNER_LINUX_BUILDS="$FAGNER_CACHE/builds"
 FAGNER_STATE="$HOME/.local/state/t3code-fagner"
-FAGNER_OPT="/opt/t3code-fagner"
-FAGNER_OPT_PREVIOUS="/opt/t3code-fagner.previous"
-FAGNER_OPT_ROLLBACK="/opt/t3code-fagner-rollback"
-NIGHTLY_OPT="/opt/t3code-nightly-bin"
 NIGHTLY_PACKAGE="t3code-nightly-bin"
+# Where T3 lives on this PC. "package": the Nightly is the pacman package in /opt and the fork goes
+# beside it, root-owned (the Acer). "home": the Nightly is an extracted AppImage in ~/Applications
+# and the fork goes beside it, owned by the user and run without Chromium's sandbox, as that
+# Nightly is (the Lenovo, Ubuntu with GNOME).
+if [ -d "/opt/$NIGHTLY_PACKAGE" ]; then
+  LAYOUT="package"
+  FAGNER_APP="/opt/t3code-fagner"
+  NIGHTLY_APP="/opt/$NIGHTLY_PACKAGE"
+  NIGHTLY_KEPT="/opt/t3code-fagner-rollback"
+  LAUNCH_ARGS=""
+else
+  LAYOUT="home"
+  FAGNER_APP="$HOME/Applications/T3-Code-Fagner"
+  NIGHTLY_APP="$HOME/Applications/T3-Code-Nightly"
+  NIGHTLY_KEPT=""
+  LAUNCH_ARGS=" --no-sandbox"
+fi
+FAGNER_APP_PREVIOUS="$FAGNER_APP.previous"
+# A user service some PCs have, which reopens T3 after a crash; it names the app folder it opens.
+WATCHDOG="$HOME/.local/bin/t3code-watchdog"
+WATCHDOG_UNIT="t3code-watchdog.service"
+DATABASE_BACKUPS="$HOME/t3-backup"
 # Same desktop id as the package's /usr/share/applications/t3code.desktop: the copy in the user's
 # folder wins, and pacman never writes there, so an update of the package cannot take it back.
 LAUNCHER="$HOME/.local/share/applications/t3code.desktop"
@@ -43,11 +62,18 @@ session_env() {
 
 # A T3 process: its executable is a t3code binary (Nightly, fork or a kept copy).
 is_t3_exe() {
-  case "$1" in
-    "$NIGHTLY_OPT/t3code" | "$FAGNER_OPT/t3code" | "$FAGNER_OPT_ROLLBACK/"*/t3code) return 0 ;;
-    *" (deleted)") is_t3_exe "${1% (deleted)}" ;;
-    *) return 1 ;;
+  local exe="${1% (deleted)}"
+  case "$exe" in
+    "$NIGHTLY_APP/t3code" | "$FAGNER_APP/t3code" | "$FAGNER_APP_PREVIOUS/t3code") return 0 ;;
   esac
+  [ -n "$NIGHTLY_KEPT" ] || return 1
+  case "$exe" in "$NIGHTLY_KEPT/"*/t3code) return 0 ;; esac
+  return 1
+}
+
+# Run a command that writes the app folders: as root where they are root's.
+as_owner() {
+  if [ "$LAYOUT" = "package" ]; then sudo "$@"; else "$@"; fi
 }
 
 # PIDs of T3's main (window) processes: no Chromium --type and not a CLI run as Node.
@@ -104,8 +130,10 @@ list_threads() {
   local project
   [ -x "$CLI_SHIM" ] || die "No t3 CLI at $CLI_SHIM"
   [ -f "$STATE_DB" ] || die "No T3 database at $STATE_DB"
-  for project in $(sqlite3 -readonly "$STATE_DB" \
-    'select project_id from projection_projects where deleted_at is null'); do
+  for project in $(python3 -c 'import sqlite3, sys
+db = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True)
+for (project,) in db.execute("select project_id from projection_projects where deleted_at is null"):
+    print(project)' "$STATE_DB"); do
     "$CLI_SHIM" thread list --project "$project" --json |
       python3 -c 'import json, sys
 for t in json.load(sys.stdin):
@@ -162,7 +190,7 @@ write_launcher() {
 [Desktop Entry]
 Name=$name
 Comment=Desktop control surface for local coding agents
-Exec=$dir/AppRun %U
+Exec=$dir/AppRun$LAUNCH_ARGS %U
 TryExec=$dir/AppRun
 Terminal=false
 Type=Application
@@ -219,7 +247,10 @@ launch_app() {
       # uwsm app waits for the app to exit, so it gets its own session.
       setsid -f uwsm app -- "$LAUNCHER_ID" >/dev/null 2>&1 </dev/null
     else
-      setsid -f "$dir/AppRun" >/dev/null 2>&1 </dev/null
+      # The user's systemd has the desktop session's environment, which an ssh login lacks.
+      # shellcheck disable=SC2086
+      systemd-run --user --quiet --collect --slice=app.slice \
+        --unit="app-t3code-$(date +%s).service" "$dir/AppRun" $LAUNCH_ARGS
     fi
     sleep 10
     if [ "$(running_app_exe)" = "$dir/t3code" ]; then
@@ -230,6 +261,42 @@ launch_app() {
     sleep $((attempt * 3))
   done
   die "T3 from $dir did not stay open after 5 launches. Open it from the launcher."
+}
+
+# The watchdog would reopen the app it names while the swap runs, so it is stopped first and
+# started again pointed at the app that was just opened. A PC without one skips both.
+stop_watchdog() {
+  [ -f "$WATCHDOG" ] || return 0
+  session_env
+  systemctl --user stop "$WATCHDOG_UNIT" 2>/dev/null || true
+  # A script that stops half way leaves the watchdog as it found it.
+  trap 'systemctl --user start "$WATCHDOG_UNIT" 2>/dev/null || true' EXIT
+}
+
+start_watchdog() {
+  local dir="$1"
+  [ -f "$WATCHDOG" ] || return 0
+  session_env
+  trap - EXIT
+  sed "s#^APP_DIR=.*#APP_DIR=\"$dir\"#" "$WATCHDOG" >"$WATCHDOG.fagner.tmp"
+  grep -qx "APP_DIR=\"$dir\"" "$WATCHDOG.fagner.tmp" || die "$WATCHDOG has no APP_DIR line to point at $dir."
+  chmod 755 "$WATCHDOG.fagner.tmp"
+  mv "$WATCHDOG.fagner.tmp" "$WATCHDOG"
+  systemctl --user start "$WATCHDOG_UNIT"
+  log "The crash watchdog reopens $dir"
+}
+
+# Put a copy of the database back (a folder holding statev2.sqlite, as kept before a build with
+# newer migrations first ran). The database in use is set aside, never deleted. T3 must have quit.
+restore_database() {
+  local from="$1" aside
+  [ -f "$from/statev2.sqlite" ] || die "No statev2.sqlite in $from."
+  [ -z "$(running_app_pids)$(running_server_pids)" ] || die "T3 Code still runs; the database stays as it is."
+  aside="$DATABASE_BACKUPS/statev2-replaced-$(date '+%Y%m%d-%H%M%S')"
+  mkdir -p "$aside"
+  mv "$STATE_DB"* "$aside/"
+  cp -a "$from"/statev2.sqlite* "$(dirname "$STATE_DB")/"
+  log "Database from $from is back; the one it replaced is in $aside"
 }
 
 # Start a copy of this script in its own systemd unit, so quitting T3 (and the ssh session that

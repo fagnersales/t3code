@@ -1,13 +1,14 @@
 #!/bin/bash
-# Make a fork build the T3 this PC opens: put it in /opt/t3code-fagner, point the launcher and the
-# t3 CLI at it, relaunch. The pacman Nightly stays installed as the rollback.
+# Make a fork build the T3 this PC opens: put it beside the Nightly (lib.sh says where), point the
+# launcher and the t3 CLI at it, relaunch. The Nightly stays installed.
 #
 #   install --quit             quit the running T3 (refuses while a thread is busy), swap, relaunch
 #   install                    only if T3 is not running
 #   options: --version V (default: the latest build)  --force (quit even with busy threads)
 #            --no-relaunch  --foreground (stay attached; used by the detached copy)
 #
-# Never touches ~/.t3/userdata: the fork adds no migrations, so the Nightly opens the same data.
+# Never touches ~/.t3/userdata. The fork adds no migrations of its own, but a build on a newer
+# Nightly brings that Nightly's: once it runs, older builds cannot open the data.
 set -euo pipefail
 source "$(dirname "$0")/lib.sh"
 
@@ -46,44 +47,51 @@ if [ "$foreground" = 0 ]; then
 fi
 
 log "install of $version started (pid $$)"
-sudo -n true 2>/dev/null || die "install needs passwordless sudo for $FAGNER_OPT."
-
-# Keep the exact Nightly that ran on this data, in case pacman updates the package later.
-nightly_version="$(app_version "$NIGHTLY_OPT")"
-if [ -n "$nightly_version" ] && [ ! -d "$FAGNER_OPT_ROLLBACK/nightly-$nightly_version" ]; then
-  sudo mkdir -p "$FAGNER_OPT_ROLLBACK"
-  sudo cp -a "$NIGHTLY_OPT" "$FAGNER_OPT_ROLLBACK/nightly-$nightly_version.partial"
-  sudo mv "$FAGNER_OPT_ROLLBACK/nightly-$nightly_version.partial" "$FAGNER_OPT_ROLLBACK/nightly-$nightly_version"
-  log "Kept Nightly $nightly_version at $FAGNER_OPT_ROLLBACK/nightly-$nightly_version"
+if [ "$LAYOUT" = "package" ]; then
+  sudo -n true 2>/dev/null || die "install needs passwordless sudo for $FAGNER_APP."
 fi
 
-# Staged before quitting, so T3 is down only for the swap. Root-owned like the package, with
-# Chromium's setuid sandbox helper.
-sudo rm -rf "$FAGNER_OPT.new"
-sudo cp -a "$build" "$FAGNER_OPT.new"
-sudo chown -R root:root "$FAGNER_OPT.new"
-sudo chmod 4755 "$FAGNER_OPT.new/chrome-sandbox"
-log "Staged $version at $FAGNER_OPT.new"
+# Keep the exact Nightly that ran on this data, in case pacman updates the package later.
+nightly_version="$(app_version "$NIGHTLY_APP")"
+if [ -n "$NIGHTLY_KEPT" ] && [ -n "$nightly_version" ] && [ ! -d "$NIGHTLY_KEPT/nightly-$nightly_version" ]; then
+  sudo mkdir -p "$NIGHTLY_KEPT"
+  sudo cp -a "$NIGHTLY_APP" "$NIGHTLY_KEPT/nightly-$nightly_version.partial"
+  sudo mv "$NIGHTLY_KEPT/nightly-$nightly_version.partial" "$NIGHTLY_KEPT/nightly-$nightly_version"
+  log "Kept Nightly $nightly_version at $NIGHTLY_KEPT/nightly-$nightly_version"
+fi
+
+# Staged before quitting, so T3 is down only for the swap. Beside the package it is root-owned
+# like the package, with Chromium's setuid sandbox helper.
+as_owner mkdir -p "$(dirname "$FAGNER_APP")"
+as_owner rm -rf "$FAGNER_APP.new"
+as_owner cp -a "$build" "$FAGNER_APP.new"
+if [ "$LAYOUT" = "package" ]; then
+  sudo chown -R root:root "$FAGNER_APP.new"
+  sudo chmod 4755 "$FAGNER_APP.new/chrome-sandbox"
+fi
+log "Staged $version at $FAGNER_APP.new"
 
 if [ -n "$(running_app_pids)" ]; then
   [ "$quit" = 1 ] || die "T3 Code is running. Run again with --quit to quit it first."
   check_not_busy "$force"
 fi
+stop_watchdog
 quit_t3_gracefully
 
-if [ -d "$FAGNER_OPT" ]; then
-  previous="$(app_version "$FAGNER_OPT")"
-  sudo rm -rf "$FAGNER_OPT_PREVIOUS"
-  sudo mv "$FAGNER_OPT" "$FAGNER_OPT_PREVIOUS"
-  log "Moved the previous fork build $previous to $FAGNER_OPT_PREVIOUS"
+if [ -d "$FAGNER_APP" ]; then
+  previous="$(app_version "$FAGNER_APP")"
+  as_owner rm -rf "$FAGNER_APP_PREVIOUS"
+  as_owner mv "$FAGNER_APP" "$FAGNER_APP_PREVIOUS"
+  log "Moved the previous fork build $previous to $FAGNER_APP_PREVIOUS"
 fi
-sudo mv "$FAGNER_OPT.new" "$FAGNER_OPT"
-log "Installed $FAGNER_OPT ($version)"
+as_owner mv "$FAGNER_APP.new" "$FAGNER_APP"
+log "Installed $FAGNER_APP ($version)"
 
-write_launcher "$FAGNER_OPT" "T3 Code (Fagner)"
-write_cli_shim "$FAGNER_OPT"
+write_launcher "$FAGNER_APP" "T3 Code (Fagner)"
+write_cli_shim "$FAGNER_APP"
 
 if [ "$relaunch" = 1 ]; then
-  launch_app "$FAGNER_OPT"
+  launch_app "$FAGNER_APP"
 fi
+start_watchdog "$FAGNER_APP"
 log "install finished. Rollback: scripts/fagner/linux rollback --quit"

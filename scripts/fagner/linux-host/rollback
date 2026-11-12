@@ -3,14 +3,18 @@
 #
 #   rollback --quit            (refuses while a thread is busy; detaches itself)
 #   options: --force  --no-relaunch  --foreground
+#            --restore-database DIR   put the database copy in DIR back first (the one in use is
+#                                     set aside in ~/t3-backup): for a Nightly older than the data
 #
 # Opens the pacman package's Nightly when it is still the version kept at install time (the one
 # that ran on this data); otherwise that kept copy in /opt/t3code-fagner-rollback, since a newer
-# Nightly would migrate the data forward. The fork stays in /opt/t3code-fagner for a later install.
+# Nightly would migrate the data forward. The fork stays where it is for a later install.
+# A PC whose Nightly sits in ~/Applications (the Lenovo) got the fork on top of an older Nightly,
+# which cannot open the data the fork upgraded, so there --restore-database is required.
 set -euo pipefail
 source "$(dirname "$0")/lib.sh"
 
-quit=0 relaunch=1 foreground=0 force=0
+quit=0 relaunch=1 foreground=0 force=0 restore=""
 args=("$@")
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -18,17 +22,25 @@ while [ $# -gt 0 ]; do
     --no-relaunch) relaunch=0 ;;
     --foreground) foreground=1 ;;
     --force) force=1 ;;
-    -h | --help) sed -n '2,10p' "$0"; exit 0 ;;
+    --restore-database) restore="$2"; shift ;;
+    -h | --help) sed -n '2,14p' "$0"; exit 0 ;;
     *) die "Unknown option $1" ;;
   esac
   shift
 done
 
+if [ "$LAYOUT" = "home" ] && [ -z "$restore" ]; then
+  die "The Nightly in $NIGHTLY_APP is older than the data. Pass --restore-database DIR with a copy from before the fork (see $DATABASE_BACKUPS); what T3 stored since then is set aside, not carried back."
+fi
+[ -z "$restore" ] || [ -f "$restore/statev2.sqlite" ] || die "No statev2.sqlite in $restore."
+
 # The kept Nightly that ran on this data (the newest, if several were kept).
-kept="$(ls -d "$FAGNER_OPT_ROLLBACK"/nightly-* 2>/dev/null | grep -v '\.partial$' | sort -V | tail -1 || true)"
-package_version="$(app_version "$NIGHTLY_OPT")"
+kept=""
+[ -z "$NIGHTLY_KEPT" ] ||
+  kept="$(ls -d "$NIGHTLY_KEPT"/nightly-* 2>/dev/null | grep -v '\.partial$' | sort -V | tail -1 || true)"
+package_version="$(app_version "$NIGHTLY_APP")"
 if [ -z "$kept" ] || [ "$(app_version "$kept")" = "$package_version" ]; then
-  target="$NIGHTLY_OPT"
+  target="$NIGHTLY_APP"
 else
   target="$kept"
 fi
@@ -49,9 +61,14 @@ if [ -n "$(running_app_pids)" ]; then
   [ "$quit" = 1 ] || die "T3 Code is running. Run again with --quit to quit it first."
   check_not_busy "$force"
 fi
+stop_watchdog
 quit_t3_gracefully
+[ -z "$restore" ] || restore_database "$restore"
 
-if [ "$target" = "$NIGHTLY_OPT" ]; then
+if [ "$LAYOUT" = "home" ]; then
+  # No package launcher to fall back on.
+  write_launcher "$target" "T3 Code (Nightly)"
+elif [ "$target" = "$NIGHTLY_APP" ]; then
   remove_launcher
 else
   log "The package is Nightly $package_version now, not the kept $(app_version "$target")."
@@ -62,4 +79,5 @@ write_cli_shim "$target"
 if [ "$relaunch" = 1 ]; then
   launch_app "$target"
 fi
+start_watchdog "$target"
 log "rollback finished. Back to the fork: scripts/fagner/linux install --quit"

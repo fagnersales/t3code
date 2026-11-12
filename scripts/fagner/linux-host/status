@@ -15,16 +15,21 @@ if [ -n "$exe" ]; then
 else
   echo "running:   nothing"
 fi
-if [ -f "$LAUNCHER" ] && grep -qx "$LAUNCHER_MARK" "$LAUNCHER"; then
+if [ -f "$LAUNCHER" ] && { [ "$LAYOUT" = "home" ] || grep -qx "$LAUNCHER_MARK" "$LAUNCHER"; }; then
   echo "launcher:  $(sed -n 's/^Exec=//p' "$LAUNCHER") ($LAUNCHER)"
 else
   echo "launcher:  the package's /usr/share/applications/$LAUNCHER_ID"
 fi
 echo "t3 CLI:    $(sed -n "s/^app='\(.*\)'$/\1/p" "$CLI_SHIM") ($("$CLI_SHIM" --version 2>/dev/null | tail -1))"
-echo "fork:      $(app_version "$FAGNER_OPT") $FAGNER_OPT"
-echo "previous:  $(app_version "$FAGNER_OPT_PREVIOUS") $FAGNER_OPT_PREVIOUS"
-echo "package:   $(pacman -Q "$NIGHTLY_PACKAGE" 2>/dev/null || echo "$NIGHTLY_PACKAGE not installed")"
-echo "kept:      $(ls -d "$FAGNER_OPT_ROLLBACK"/nightly-* 2>/dev/null | tr '\n' ' ')"
+echo "fork:      $(app_version "$FAGNER_APP") $FAGNER_APP"
+echo "previous:  $(app_version "$FAGNER_APP_PREVIOUS") $FAGNER_APP_PREVIOUS"
+if [ "$LAYOUT" = "package" ]; then
+  echo "package:   $(pacman -Q "$NIGHTLY_PACKAGE" 2>/dev/null || echo "$NIGHTLY_PACKAGE not installed")"
+  echo "kept:      $(ls -d "$NIGHTLY_KEPT"/nightly-* 2>/dev/null | tr '\n' ' ')"
+else
+  echo "nightly:   $(app_version "$NIGHTLY_APP") $NIGHTLY_APP"
+  echo "database copies: $(ls -d "$DATABASE_BACKUPS"/statev2-* 2>/dev/null | tr '\n' ' ')"
+fi
 echo "builds:    $(ls "$FAGNER_LINUX_BUILDS" 2>/dev/null | grep -v '^latest$' | tr '\n' ' ')"
 threads="$(list_threads 2>/dev/null || true)"
 echo "threads:   $(echo "$threads" | grep -c . || true)"

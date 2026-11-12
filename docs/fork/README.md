@@ -50,7 +50,7 @@ backup.
 | `rollback --quit` | The reverse: puts the kept Nightly back, points `t3` at it, relaunches it.                                                                                    |
 | `setup-signing`   | Makes the local certificate `build` signs with, once. macOS then takes every build for the same app and keeps the permissions granted to it.                  |
 | `update`          | Fetches upstream, merges the newest Nightly tag into `fagner/main` (stops if it adds migrations, unless `--accept-migrations`), installs, tests, builds.      |
-| `linux …`         | The same for the Linux PC (the Acer), run from the Mac: `build`, `install --quit`, `rollback --quit`, `status`, `deploy`. See [Linux PC](#linux-pc-the-acer). |
+| `linux …`         | The same for the Linux PCs (the Acer and the Lenovo), run from the Mac: `build`, `install --quit`, `rollback --quit`, `status`, `deploy`. See [Linux PCs](#linux-pcs). |
 | `shrink --quit`   | Quits T3, pauses Headquarters' device program, runs `t3 doctor --fix` (gives the database's free space back), then starts both again.                         |
 
 `install` and `rollback` never copy or open the database. Run without `--quit`, they refuse while
@@ -129,25 +129,39 @@ cd ~/work/t3code-worktrees/fagner-main
 scripts/fagner/update            # newest upstream Nightly tag; stops if it adds migrations
 scripts/fagner/update --accept-migrations --push
 scripts/fagner/install --quit
+scripts/fagner/linux deploy      # every update goes to the Linux PCs too
 ```
 
 Taking migrations is a one-way door for rollback: after the new build runs, only Nightlies at
 least as new as its base can open the data. `update` names the migrations before it stops.
 
-## Linux PC (the Acer)
+An update is done when the Mac, the Acer and the Lenovo all run it. A PC that was off or busy is
+named by `linux deploy`; run `scripts/fagner/linux deploy --on HOST` for it later.
 
-The Acer (`acer@omarchy-acer`, Arch with Omarchy and Hyprland) runs the same fork. Everything is
-driven from the Mac with `scripts/fagner/linux`; the PC is `$T3_FAGNER_LINUX_HOST` (default
-`acer@omarchy-acer`).
+## Linux PCs
+
+Two PCs run the same fork, both driven from the Mac with `scripts/fagner/linux`:
+
+- **The Acer** (`acer@omarchy-acer`, Arch with Omarchy and Hyprland), `$T3_FAGNER_LINUX_HOST`. It
+  builds.
+- **The Lenovo** (ssh host `filipe`: `filipe-lenovo` on Tailscale, Ubuntu with GNOME, 7 GB of
+  memory), in `$T3_FAGNER_LINUX_COPIES`. It never builds: it gets the Acer's build, copied through
+  the Mac and checked there by running its CLI.
 
 ```sh
 cd ~/work/t3code-worktrees/fagner-main
-scripts/fagner/linux deploy            # build this commit on the Acer, then install --quit
-scripts/fagner/linux status            # what runs there, the launcher, the CLI, busy threads
-scripts/fagner/linux rollback --quit   # back to the Nightly
+scripts/fagner/linux deploy            # build on the Acer, copy to the Lenovo, install --quit on both
+scripts/fagner/linux status            # what runs on each, the launcher, the CLI, busy threads
+scripts/fagner/linux rollback --quit --on acer@omarchy-acer   # one PC back to its Nightly
 ```
 
-`deploy` is `build` then `install --quit`; each also runs alone.
+`deploy` is `build` then `install --quit`; each also runs alone. Every command takes `--on HOST`
+for one PC. A PC that is off, or refuses because a thread is busy, does not stop the other: the
+command finishes there and ends with an error naming the PC left out.
+
+The scripts that run on a PC (`scripts/fagner/linux-host/`) pick its layout by themselves: the
+pacman package in `/opt` (the Acer, below), or an extracted AppImage in `~/Applications` (the
+Lenovo, [further down](#the-lenovo)).
 
 - **Built on the Acer, not cross-built.** A Linux build must run on Linux: node-pty is compiled
   from source there and the browser secret helper links against libsecret
@@ -192,3 +206,28 @@ its GPU process, so the fork gets it like the Nightly and every other Electron a
 To see T3's window without raising it (someone else may be using the screen), capture it by its
 toplevel id: `hyprctl clients -j` gives the window's `stableId`, and `grim -T <stableId> -` captures
 it even under a fullscreen window.
+
+### The Lenovo
+
+Filipe's PC. It ran the Nightly `0.0.46-nightly.20261013.3066`, extracted in
+`~/Applications/T3-Code-Nightly` and opened with `--no-sandbox`; the fork went in on 2026-11-11.
+
+| Path                                         | What                                                                                          |
+| -------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `~/Applications/T3-Code-Fagner`              | The fork, owned by the user, opened with `--no-sandbox`. `.previous` is the one before.       |
+| `~/Applications/T3-Code-Nightly`             | The old Nightly, untouched.                                                                   |
+| `~/t3-backup/statev2-before-fagner-<time>`   | The database as that Nightly left it (2.2 GB), copied before the fork first ran.              |
+| `~/.local/share/applications/t3code.desktop` | The launcher, "T3 Code (Fagner)".                                                             |
+| `~/.local/bin/t3code-watchdog`               | Filipe's user service that reopens T3 after a crash; `install` points its `APP_DIR` at the fork. |
+| `~/.t3/bin/t3`                               | The CLI shim, pointed at the fork.                                                            |
+
+- **install** stops the watchdog, quits T3, swaps, opens the fork through the user's systemd
+  (`systemd-run --user`, which has GNOME's session environment), and starts the watchdog again
+  pointed at the fork.
+- **Rollback loses data.** That Nightly is older than the fork's base, so it cannot open the data
+  the fork upgraded. `scripts/fagner/linux rollback --quit --on filipe --restore-database
+  ~/t3-backup/statev2-before-fagner-<time>` puts the old database back with the old Nightly; what
+  T3 stored since is set aside in `~/t3-backup/statev2-replaced-<time>`, not carried back. Without
+  `--restore-database` it refuses.
+- The PC is short on memory and disk: never build there, and delete the database copy once
+  nobody wants the old Nightly back.
