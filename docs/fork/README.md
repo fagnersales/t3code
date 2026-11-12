@@ -34,6 +34,9 @@ Fagner's T3 Code: the Nightly he ran, plus live thread and project feeds for Hea
   and forks, out of the database into compressed files under `~/.t3/offload/`; `t3 thread restore`
   puts one back exactly and keeps the bundle (`t3 thread prune-restored` deletes old ones). Runs
   inside the running server. See [thread-offload.md](thread-offload.md).
+- **Start effort:** `t3 thread start --provider P --model M --effort medium` starts the thread
+  with the model's `effort` option set, as the model picker does. Headquarters passes the effort
+  its Settings chose.
 - **Build identity:** versions `<nightly>-fagner.N`, app name `T3 Code (Fagner)`, no update feed
   (the updater reports updates as unavailable, so nothing can replace it with upstream).
 
@@ -43,15 +46,15 @@ backup.
 
 ## Scripts (`scripts/fagner/`)
 
-| Script            | Does                                                                                                                                                          |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `build`           | Builds `T3 Code (Fagner).app` with its `t3` CLI into `~/work/t3code-fagner-builds.noindex/<version>/`, signs it, points `latest` at it.                       |
-| `install --quit`  | Quits T3 gracefully, keeps the running Nightly for rollback, puts the newest build in `/Applications`, points `~/.t3/bin/t3` at it, relaunches.               |
-| `rollback --quit` | The reverse: puts the kept Nightly back, points `t3` at it, relaunches it.                                                                                    |
-| `setup-signing`   | Makes the local certificate `build` signs with, once. macOS then takes every build for the same app and keeps the permissions granted to it.                  |
-| `update`          | Fetches upstream, merges the newest Nightly tag into `fagner/main` (stops if it adds migrations, unless `--accept-migrations`), installs, tests, builds.      |
+| Script            | Does                                                                                                                                                                   |
+| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `build`           | Builds `T3 Code (Fagner).app` with its `t3` CLI into `~/work/t3code-fagner-builds.noindex/<version>/`, signs it, points `latest` at it.                                |
+| `install --quit`  | Quits T3 gracefully, keeps the running Nightly for rollback, puts the newest build in `/Applications`, points `~/.t3/bin/t3` at it, relaunches.                        |
+| `rollback --quit` | The reverse: puts the kept Nightly back, points `t3` at it, relaunches it.                                                                                             |
+| `setup-signing`   | Makes the local certificate `build` signs with, once. macOS then takes every build for the same app and keeps the permissions granted to it.                           |
+| `update`          | Fetches upstream, merges the newest Nightly tag into `fagner/main` (stops if it adds migrations, unless `--accept-migrations`), installs, tests, builds.               |
 | `linux …`         | The same for the Linux PCs (the Acer and the Lenovo), run from the Mac: `build`, `install --quit`, `rollback --quit`, `status`, `deploy`. See [Linux PCs](#linux-pcs). |
-| `shrink --quit`   | Quits T3, pauses Headquarters' device program, runs `t3 doctor --fix` (gives the database's free space back), then starts both again.                         |
+| `shrink --quit`   | Quits T3, pauses Headquarters' device program, runs `t3 doctor --fix` (gives the database's free space back), then starts both again.                                  |
 
 `install` and `rollback` never copy or open the database. Run without `--quit`, they refuse while
 T3 is running. They reopen T3 with the environment the Dock gives it and open it again if it quits
@@ -212,14 +215,14 @@ it even under a fullscreen window.
 Filipe's PC. It ran the Nightly `0.0.46-nightly.20261013.3066`, extracted in
 `~/Applications/T3-Code-Nightly` and opened with `--no-sandbox`; the fork went in on 2026-11-11.
 
-| Path                                         | What                                                                                          |
-| -------------------------------------------- | --------------------------------------------------------------------------------------------- |
-| `~/Applications/T3-Code-Fagner`              | The fork, owned by the user, opened with `--no-sandbox`. `.previous` is the one before.       |
-| `~/Applications/T3-Code-Nightly`             | The old Nightly, untouched.                                                                   |
-| `~/t3-backup/statev2-before-fagner-<time>`   | The database as that Nightly left it (2.2 GB), copied before the fork first ran.              |
-| `~/.local/share/applications/t3code.desktop` | The launcher, "T3 Code (Fagner)".                                                             |
+| Path                                         | What                                                                                             |
+| -------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `~/Applications/T3-Code-Fagner`              | The fork, owned by the user, opened with `--no-sandbox`. `.previous` is the one before.          |
+| `~/Applications/T3-Code-Nightly`             | The old Nightly, untouched.                                                                      |
+| `~/t3-backup/statev2-before-fagner-<time>`   | The database as that Nightly left it (2.2 GB), copied before the fork first ran.                 |
+| `~/.local/share/applications/t3code.desktop` | The launcher, "T3 Code (Fagner)".                                                                |
 | `~/.local/bin/t3code-watchdog`               | Filipe's user service that reopens T3 after a crash; `install` points its `APP_DIR` at the fork. |
-| `~/.t3/bin/t3`                               | The CLI shim, pointed at the fork.                                                            |
+| `~/.t3/bin/t3`                               | The CLI shim, pointed at the fork.                                                               |
 
 - **install** stops the watchdog, quits T3, swaps, opens the fork through the user's systemd
   (`systemd-run --user`, which has GNOME's session environment), and starts the watchdog again
