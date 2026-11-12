@@ -5,7 +5,7 @@ import type {
   OrchestrationV2ThreadProjection,
   ProviderInstanceId,
 } from "@t3tools/contracts";
-import { OrchestrationV2RunStatus } from "@t3tools/contracts";
+import { isListedThreadLineage, OrchestrationV2RunStatus } from "@t3tools/contracts";
 import {
   COMPACTION_SUGGESTION_MIN_TOKENS,
   hasDismissedResumeCompaction,
@@ -101,10 +101,13 @@ function activeClaudeSessionUsage(
 }
 
 function latestRunOf(runs: IdleCompactionRecords["runs"]): OrchestrationV2Run | null {
-  return runs.reduce<OrchestrationV2Run | null>(
-    (latest, run) => (latest === null || run.ordinal > latest.ordinal ? run : latest),
-    null,
-  );
+  // A removed or steered queued message leaves a cancelled run that never started.
+  return runs
+    .filter((run) => run.status !== "cancelled" || run.startedAt !== null)
+    .reduce<OrchestrationV2Run | null>(
+      (latest, run) => (latest === null || run.ordinal > latest.ordinal ? run : latest),
+      null,
+    );
 }
 
 const IDLE_RUN_STATUSES: ReadonlySet<OrchestrationV2Run["status"]> = new Set([
@@ -184,7 +187,7 @@ export function idleCompactionWindow(
   if (thread.settledAt !== null || thread.settledOverride === "settled") return null;
   if (thread.snoozedUntil != null && DateTime.toEpochMillis(thread.snoozedUntil) > nowMs)
     return null;
-  if (thread.lineage.relationshipToParent === "subagent") return null;
+  if (!isListedThreadLineage(thread.lineage)) return null;
   const latestRun = latestRunOf(runs);
   if (latestRun?.status !== "completed" || latestRun.completedAt === null) return null;
   const message = messages.find((candidate) => candidate.id === latestRun.userMessageId);

@@ -4,7 +4,10 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
+import * as SqlClient from "effect/sql/SqlClient";
 
+import { ORCHESTRATION_V2_PROJECTION_SCHEMA_VERSION } from "../orchestration-v2/ProjectionStore.ts";
+import { EVENT_LOG_PRUNED_THROUGH } from "../persistence/OrchestrationEventStore.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ThreadFeed from "./ThreadFeed.ts";
 import {
@@ -115,6 +118,47 @@ layer("ThreadFeed", (it) => {
           'text +"lo, wor" =10',
           "item assistant_message completed Hello, world.",
           "run completed",
+        ]);
+      }),
+    ),
+  );
+
+  it.effect("after a position whose events were pruned, starts over from the newest items", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const now = yield* DateTime.now;
+        const threadId = yield* seedThread("Pruned");
+        const position = yield* writeEvents(threadId, [
+          { type: "turn-item.updated", payload: userMessage(threadId, 0, "old", now) },
+        ]);
+        const pruned = yield* writeEvents(threadId, [
+          { type: "turn-item.updated", payload: userMessage(threadId, 1, "pruned", now) },
+        ]);
+        yield* writeEvents(threadId, [
+          { type: "turn-item.updated", payload: userMessage(threadId, 2, "kept", now) },
+        ]);
+        yield* sql`
+          INSERT INTO orchestration_v2_projection_metadata (
+            projection_name, schema_version, last_sequence, updated_at
+          )
+          VALUES (
+            ${EVENT_LOG_PRUNED_THROUGH},
+            ${ORCHESTRATION_V2_PROJECTION_SCHEMA_VERSION},
+            ${pruned},
+            ${DateTime.formatIso(now)}
+          )
+          ON CONFLICT(projection_name) DO UPDATE SET last_sequence = excluded.last_sequence
+        `;
+
+        const events = yield* follow({ threadId, after: position });
+        const start = yield* takeThrough(events, "ready");
+        // The replay would have started after `position`; the pruned change still arrives.
+        assert.deepEqual(start.map(summary), [
+          "item user_message completed old",
+          "item user_message completed pruned",
+          "item user_message completed kept",
+          "ready",
         ]);
       }),
     ),

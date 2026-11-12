@@ -10,7 +10,7 @@ import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http";
 
 import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
 import * as ServerConfig from "../config.ts";
-import { readPersistedServerRuntimeState } from "../serverRuntimeState.ts";
+import { readLiveServerRuntimeState } from "../serverRuntimeState.ts";
 
 const SESSION_TTL = Duration.minutes(15);
 const RETRY_MIN_MS = 1_000;
@@ -49,7 +49,7 @@ export const followFeed = Effect.fn("cli.feed.follow")(function* <Event>(
   const { config } = input;
   let retryMs = RETRY_MIN_MS;
   const connectOnce = Effect.gen(function* () {
-    const runtimeState = yield* readPersistedServerRuntimeState(config.serverRuntimeStatePath);
+    const runtimeState = yield* readLiveServerRuntimeState(config.serverRuntimeStatePath);
     if (Option.isNone(runtimeState)) {
       return yield* new FeedConnectionError({
         reason: `No running T3 Code server uses ${config.baseDir}.`,

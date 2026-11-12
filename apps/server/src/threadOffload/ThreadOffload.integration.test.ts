@@ -32,7 +32,7 @@ import { ClaudeOrchestratorReplayHarness } from "../orchestration-v2/Adapters/Cl
 import { CodexOrchestratorReplayHarness } from "../orchestration-v2/Adapters/CodexAdapterV2.testkit.ts";
 import * as EventSink from "../orchestration-v2/EventSink.ts";
 import * as EventStore from "../orchestration-v2/EventStore.ts";
-import * as ProjectionMaintenance from "../orchestration-v2/ProjectionMaintenance.ts";
+import * as ProjectionReplay from "../orchestration-v2/testkit/ProjectionReplay.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import { materializeFixtureInput } from "../orchestration-v2/testkit/fixtures/shared.ts";
 import {
@@ -250,7 +250,7 @@ const assertProjectionsMatchRebuild = Effect.fn("assertProjectionsMatchRebuild")
   // Its own memo map, or the shared store layers would rebuild the original file.
   const rebuilt = yield* Effect.gen(function* () {
     const context = yield* Layer.buildWithMemoMap(
-      ProjectionMaintenance.layer.pipe(
+      ProjectionReplay.layer.pipe(
         Layer.provide(Layer.merge(EventStore.layer, ProjectionStore.layer)),
         Layer.provideMerge(NodeSqliteClient.layer({ filename: copyPath })),
       ),
@@ -258,7 +258,7 @@ const assertProjectionsMatchRebuild = Effect.fn("assertProjectionsMatchRebuild")
       yield* Effect.scope,
     );
     return yield* Effect.gen(function* () {
-      const copy = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
+      const copy = yield* ProjectionReplay.ProjectionReplay;
       assert.isTrue((yield* copy.rebuild).valid);
       return yield* snapshot({ withRowids: false });
     }).pipe(Effect.provide(context));
@@ -276,7 +276,7 @@ const layerFor = (dbPath: string) =>
   ThreadOffload.layer.pipe(
     Layer.provideMerge(ThreadCommandExecutor.layer),
     Layer.provideMerge(
-      ProjectionMaintenance.layer.pipe(
+      ProjectionReplay.layer.pipe(
         Layer.provide(Layer.merge(EventStore.layer, ProjectionStore.layer)),
         Layer.provideMerge(ProjectionStore.layer),
       ),
@@ -371,7 +371,7 @@ describe("ThreadOffload", () => {
         yield* Effect.gen(function* () {
           const sql = yield* SqlClient.SqlClient;
           const offload = yield* ThreadOffload.ThreadOffload;
-          const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
+          const maintenance = yield* ProjectionReplay.ProjectionReplay;
           const projections = yield* ProjectionStore.ProjectionStoreV2;
           const fs = yield* FileSystem.FileSystem;
           const keepThreadIds = new Set<string>();
