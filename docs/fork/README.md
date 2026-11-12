@@ -5,9 +5,10 @@ Fagner's T3 Code: the Nightly he ran, plus live thread and project feeds for Hea
 
 ## What it is
 
-- **Base:** upstream commit `6d450a4` (tag `v0.1.5-nightly.20261029.3877`), exactly the Nightly
-  that was installed when the fork was made, so the fork reads his database as that Nightly
-  left it. No newer upstream code, so no newer migrations.
+- **Base:** upstream tag `v0.1.10-nightly.20261112.4580`, merged on 2026-11-12. The fork began on
+  `v0.1.5-nightly.20261029.3877`, the Nightly that was installed when it was made; the update
+  brought that Nightly's migrations `073` to `083`, so builds from before it cannot open data
+  this one has run on.
 - **Faster thread reads:** `t3 thread show` reads from the end of a thread instead of paging
   through it (backport of upstream PR #33079, branch `perf/thread-read-tail`).
 - **Live feed:** `t3 thread follow` and `GET /api/thread-feed/v1`, see
@@ -41,8 +42,11 @@ Fagner's T3 Code: the Nightly he ran, plus live thread and project feeds for Hea
   (the updater reports updates as unavailable, so nothing can replace it with upstream).
 
 **Database migrations added by the fork: none.** Its migrations are the Nightly's own
-(`001` to `072` and the `OrchestrationV2` set). That is what keeps rollback possible without a
-backup.
+(`001` to `083` and the `OrchestrationV2` set).
+
+Upstream now deletes orchestration events older than a day once projections cover them. So
+`t3 thread follow --after` with a position older than that starts over like a fresh follow (the
+newest 200 items, then `ready`) instead of resuming; the line format is unchanged.
 
 ## Scripts (`scripts/fagner/`)
 
@@ -118,7 +122,9 @@ What changes on disk:
 
 It quits the fork, moves it to `~/work/t3code-fagner-builds.noindex/rollback/T3 Code (Fagner)
 uninstalled.app`, puts the kept Nightly 3877 back in `/Applications`, points `t3` at it and
-opens it. The data needs nothing: the fork never changed its schema.
+opens it. **Since the update to Nightly 4580 this no longer works on data the fork has run on:**
+Nightly 3877 cannot open a database migrated past `072`. Going back now means installing an
+upstream Nightly at least as new as the fork's base.
 
 Once back on Nightly its updater returns. When it updates to a newer Nightly, that build migrates
 the database forward (upstream had added migrations `073` to `080` by 2026-11-09); from then on,
