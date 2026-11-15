@@ -4,14 +4,21 @@ import {
   NodeId,
   type OrchestrationV2AppThread,
   type OrchestrationV2DomainEvent,
+  type OrchestrationV2ProviderThread,
+  type OrchestrationV2ProviderTurn,
+  type OrchestrationV2ProviderTurnTokenUsage,
   type OrchestrationV2Run,
   type OrchestrationV2RuntimeRequest,
   type OrchestrationV2TurnItem,
   type ProjectId,
+  ProviderDriverKind,
   ProviderInstanceId,
+  ProviderThreadId,
+  ProviderTurnId,
   RunId,
   RuntimeRequestId,
   type ThreadId,
+  type ThreadTokenUsageSnapshot,
   TurnItemId,
 } from "@t3tools/contracts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -61,11 +68,15 @@ export const writeEvents = Effect.fn("threadFeedTestkit.writeEvents")(function* 
     | { readonly type: "turn-item.updated"; readonly payload: OrchestrationV2TurnItem }
     | { readonly type: "run.updated"; readonly payload: OrchestrationV2Run }
     | { readonly type: "runtime-request.updated"; readonly payload: OrchestrationV2RuntimeRequest }
+    | { readonly type: "provider-thread.updated"; readonly payload: OrchestrationV2ProviderThread }
+    | { readonly type: "provider-turn.updated"; readonly payload: OrchestrationV2ProviderTurn }
   >,
+  /** When the events happened; now, unless a test or the benchmark spaces them out. */
+  occurredAt?: DateTime.Utc,
 ) {
   const idAllocator = yield* IdAllocator.IdAllocatorV2;
   const eventSink = yield* EventSink.EventSinkV2;
-  const now = yield* DateTime.now;
+  const now = occurredAt ?? (yield* DateTime.now);
   const domain: Array<OrchestrationV2DomainEvent> = [];
   for (const event of events) {
     domain.push({
@@ -289,6 +300,56 @@ export const run = (
   completedAt: status === "completed" ? now : null,
   checkpointId: null,
   contextHandoffId: null,
+});
+
+/** A conversation with the provider: the thread's own, or with `ownerNodeId` a subagent's. */
+export const providerThread = (
+  threadId: ThreadId,
+  name: string,
+  now: DateTime.Utc,
+  options?: {
+    readonly contextUsage?: ThreadTokenUsageSnapshot;
+    readonly ownerNodeId?: NodeId;
+  },
+): OrchestrationV2ProviderThread => ({
+  id: ProviderThreadId.make(`${threadId}:provider-thread-${name}`),
+  driver: ProviderDriverKind.make("codex"),
+  providerInstanceId: modelSelection.instanceId,
+  providerSessionId: null,
+  appThreadId: options?.ownerNodeId === undefined ? threadId : null,
+  ownerNodeId: options?.ownerNodeId ?? null,
+  nativeThreadRef: null,
+  nativeConversationHeadRef: null,
+  status: "idle",
+  firstRunOrdinal: 1,
+  lastRunOrdinal: 1,
+  handoffIds: [],
+  forkedFrom: null,
+  pendingBackgroundTasks: [],
+  contextUsage: options?.contextUsage ?? null,
+  nativeMetadata: null,
+  goal: null,
+  createdAt: now,
+  updatedAt: now,
+});
+
+/** A provider turn, with the context usage the provider reported in it. */
+export const providerTurn = (
+  conversation: OrchestrationV2ProviderThread,
+  ordinal: number,
+  now: DateTime.Utc,
+  usage?: Omit<OrchestrationV2ProviderTurnTokenUsage, "updatedAt">,
+): OrchestrationV2ProviderTurn => ({
+  id: ProviderTurnId.make(`${conversation.id}:turn-${ordinal}`),
+  providerThreadId: conversation.id,
+  nodeId: NodeId.make(`${conversation.id}:node-${ordinal}`),
+  runAttemptId: null,
+  nativeTurnRef: null,
+  ordinal,
+  status: "running",
+  startedAt: now,
+  completedAt: null,
+  ...(usage === undefined ? {} : { tokenUsage: { ...usage, updatedAt: DateTime.formatIso(now) } }),
 });
 
 export { NodeId, RuntimeRequestId };

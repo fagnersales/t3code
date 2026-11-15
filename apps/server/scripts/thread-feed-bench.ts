@@ -11,7 +11,12 @@ import * as NodePerfHooks from "node:perf_hooks";
 
 import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import type { OrchestrationV2TurnItem, ThreadFeedEvent, ThreadId } from "@t3tools/contracts";
+import type {
+  OrchestrationV2ProviderThread,
+  OrchestrationV2TurnItem,
+  ThreadFeedEvent,
+  ThreadId,
+} from "@t3tools/contracts";
 import * as Console from "effect/Console";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -26,6 +31,8 @@ import {
   assistantMessage,
   commandItem,
   layerFeedOn,
+  providerThread,
+  providerTurn,
   seedThread,
   userMessage,
   writeEvents,
@@ -35,6 +42,9 @@ const ITEMS = Number(process.argv[2] ?? 30_000);
 const SMALL_ITEMS = 1_000;
 const RUNS = 20;
 const BATCH = 500;
+/** One provider turn, with its usage, for this many items. */
+const ITEMS_PER_TURN = 10;
+const MAX_TOKENS = 1_000_000;
 
 const median = (values: ReadonlyArray<number>) => {
   const sorted = values.toSorted((a, b) => a - b);
@@ -51,6 +61,8 @@ const timed = Effect.fn("bench.timed")(function* <A, E, R>(effect: Effect.Effect
 const fillThread = Effect.fn("bench.fillThread")(function* (title: string, count: number) {
   const now = yield* DateTime.now;
   const threadId = yield* seedThread(title);
+  const conversation = providerThread(threadId, "main", now);
+  yield* writeEvents(threadId, [{ type: "provider-thread.updated", payload: conversation }]);
   let position = 0;
   for (let start = 0; start < count; start += BATCH) {
     const items: Array<OrchestrationV2TurnItem> = [];
@@ -64,12 +76,23 @@ const fillThread = Effect.fn("bench.fillThread")(function* (title: string, count
             : commandItem(threadId, ordinal, text.repeat(5), now),
       );
     }
+    const turns = Array.from({ length: Math.ceil(items.length / ITEMS_PER_TURN) }, (_, index) => {
+      const ordinal = start / ITEMS_PER_TURN + index + 1;
+      return providerTurn(conversation, ordinal, now, {
+        usedTokens: (ordinal * 997) % MAX_TOKENS,
+        maxTokens: MAX_TOKENS,
+      });
+    });
+    yield* writeEvents(
+      threadId,
+      turns.map((payload) => ({ type: "provider-turn.updated" as const, payload })),
+    );
     position = yield* writeEvents(
       threadId,
       items.map((payload) => ({ type: "turn-item.updated" as const, payload })),
     );
   }
-  return { threadId, position };
+  return { threadId, position, conversation, turns: Math.ceil(count / ITEMS_PER_TURN) };
 });
 
 /** Time from subscribing to the feed's `ready` event, and the events before it. */
@@ -83,6 +106,43 @@ const timeToReady = Effect.fn("bench.timeToReady")(function* (
     Stream.runCollect,
   );
   return { ms: NodePerfHooks.performance.now() - start, events: events.length };
+});
+
+/** From the write of a turn's usage to its `usage` line; each report is a second after the last. */
+const usageLatency = Effect.fn("bench.usageLatency")(function* (
+  threadId: ThreadId,
+  conversation: OrchestrationV2ProviderThread,
+  turn: number,
+) {
+  const feed = yield* ThreadFeed.ThreadFeed;
+  const now = yield* DateTime.now;
+  const events = yield* Queue.unbounded<ThreadFeedEvent>();
+  yield* feed.follow({ threadId }).pipe(
+    Stream.runForEach((event) => Queue.offer(events, event)),
+    Effect.forkScoped,
+  );
+  while ((yield* Queue.take(events)).type !== "ready");
+  const samples: Array<number> = [];
+  for (let index = 0; index < RUNS; index++) {
+    const at = DateTime.add(now, { seconds: index + 1 });
+    const start = NodePerfHooks.performance.now();
+    yield* writeEvents(
+      threadId,
+      [
+        {
+          type: "provider-turn.updated",
+          payload: providerTurn(conversation, turn, at, {
+            usedTokens: 500_000 + index,
+            maxTokens: MAX_TOKENS,
+          }),
+        },
+      ],
+      at,
+    );
+    while ((yield* Queue.take(events)).type !== "usage");
+    samples.push(NodePerfHooks.performance.now() - start);
+  }
+  return median(samples);
 });
 
 const liveLatency = Effect.fn("bench.liveLatency")(function* (threadId: ThreadId, first: number) {
@@ -110,8 +170,10 @@ const liveLatency = Effect.fn("bench.liveLatency")(function* (threadId: ThreadId
 const measure = Effect.fn("bench.measure")(function* (label: string, count: number) {
   const projections = yield* ProjectionStore.ProjectionStoreV2;
   const filled = yield* timed(fillThread(label, count));
-  const { threadId, position } = filled.result;
-  yield* Console.log(`\n${label}: ${count} items (written in ${ms(filled.ms)})`);
+  const { threadId, position, conversation, turns } = filled.result;
+  yield* Console.log(
+    `\n${label}: ${count} items, ${turns} provider turns (written in ${ms(filled.ms)})`,
+  );
 
   const resume: Array<number> = [];
   const fresh: Array<number> = [];
@@ -140,12 +202,14 @@ const measure = Effect.fn("bench.measure")(function* (label: string, count: numb
     projection.push((yield* timed(projections.getThreadProjection(threadId))).ms);
   }
   const latency = yield* Effect.scoped(liveLatency(threadId, count));
+  const usage = yield* Effect.scoped(usageLatency(threadId, conversation, turns));
   yield* Console.log(
     [
       `  feed: resume after a position (10 newer items, ${resumeEvents} events) ${ms(median(resume))}`,
-      `  feed: start fresh (state only)                                ${ms(median(fresh))}`,
+      `  feed: start fresh (state only: ready with its usage)          ${ms(median(fresh))}`,
       `  feed: start fresh with --tail 20                               ${ms(median(tail))}`,
       `  feed: write → event on the stream (live)                       ${ms(latency)}`,
+      `  feed: usage write → usage line on the stream (live)            ${ms(usage)}`,
       `  baseline: t3_thread_read newest 10 messages (thread show)      ${ms(median(timeline))}`,
       `  baseline: getThreadProjection (Headquarters' request read)     ${ms(median(projection))}`,
     ].join("\n"),
