@@ -2,6 +2,7 @@ import {
   THREAD_FEED_ROUTE,
   THREAD_FEED_VERSION,
   ThreadFeedEvent,
+  type ThreadFeedUsage,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Console from "effect/Console";
@@ -72,11 +73,21 @@ const feedUrl = (
   return url;
 };
 
+const formatUsage = (usage: ThreadFeedUsage) => {
+  const max = usage.maxTokens ?? null;
+  const used = usage.usedTokens.toLocaleString("en-US");
+  return max === null || max <= 0
+    ? `${used} tokens`
+    : `${used} of ${max.toLocaleString("en-US")} tokens (${Math.round((usage.usedTokens / max) * 100)}%)`;
+};
+
 /** One line for a person reading along; scripts use --jsonl. */
-const formatText = (event: ThreadFeedEvent): string | null => {
+export const formatText = (event: ThreadFeedEvent): string | null => {
   switch (event.type) {
     case "ready":
-      return `[${event.threadId}] ready  ${event.thread.status}  ${event.thread.title}`;
+      return `[${event.threadId}] ready  ${event.thread.status}  ${event.thread.title}${
+        event.usage == null ? "" : `  context ${formatUsage(event.usage)}`
+      }`;
     case "item":
       return `[${event.threadId}] ${event.item.role ?? event.item.kind} (${event.item.status})${
         event.item.text === undefined ? "" : `\n${event.item.text}`
@@ -89,6 +100,8 @@ const formatText = (event: ThreadFeedEvent): string | null => {
       return `[${event.threadId}] ${event.request.kind} ${event.request.state}: ${
         event.request.prompt ?? event.request.questions?.map((q) => q.question).join(" / ") ?? ""
       }`;
+    case "usage":
+      return `[${event.threadId}] context ${formatUsage(event.usage)}`;
     case "error":
       return `[${event.threadId}] error: ${event.message}`;
     case "disconnected":

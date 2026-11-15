@@ -25,6 +25,17 @@ export const ThreadFeedRun = Schema.Struct({
 });
 export type ThreadFeedRun = typeof ThreadFeedRun.Type;
 
+/** How full the thread's own context is, as T3's window shows it. Subagents' turns never count. */
+export const ThreadFeedUsage = Schema.Struct({
+  usedTokens: Schema.Int,
+  /** The context window's size; null when the provider gave none. */
+  maxTokens: Schema.optionalKey(Schema.NullOr(Schema.Int)),
+  /** Where the provider compacts by itself; absent when it has no such point. */
+  autoCompactThreshold: Schema.optionalKey(Schema.Int),
+  updatedAt: Schema.String,
+});
+export type ThreadFeedUsage = typeof ThreadFeedUsage.Type;
+
 export const ThreadFeedTool = Schema.Struct({
   name: Schema.NullOr(Schema.String),
   input: Schema.optionalKey(Schema.String),
@@ -95,6 +106,8 @@ export const ThreadFeedEvent = Schema.Union([
     }),
     run: Schema.NullOr(ThreadFeedRun),
     requests: Schema.Array(ThreadFeedRequest),
+    /** The thread's newest usage, or null when no provider reported one. */
+    usage: Schema.optionalKey(Schema.NullOr(ThreadFeedUsage)),
   }),
   /** A new item, or an item whose status or content changed: upsert it by `itemId`. */
   ThreadEvent("item", { item: ThreadFeedItem }),
@@ -108,6 +121,8 @@ export const ThreadFeedEvent = Schema.Union([
   }),
   ThreadEvent("run", { run: ThreadFeedRun }),
   ThreadEvent("request", { request: ThreadFeedRequest }),
+  /** The thread's context usage changed. */
+  ThreadEvent("usage", { usage: ThreadFeedUsage }),
   /** The thread cannot be followed (for example it does not exist); its feed ends. */
   ThreadEvent("error", { message: Schema.String }),
   Schema.Struct({ v: Version, type: Schema.Literal("heartbeat") }),

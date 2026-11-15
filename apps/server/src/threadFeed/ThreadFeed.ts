@@ -1,8 +1,10 @@
 import {
+  OrchestrationV2ProviderTurnTokenUsage,
   OrchestrationV2RunJson,
   OrchestrationV2RuntimeRequestJson,
   OrchestrationV2TurnItemJson,
   THREAD_FEED_VERSION,
+  ThreadTokenUsageSnapshot,
   type OrchestrationV2Run,
   type OrchestrationV2RuntimeRequest,
   type OrchestrationV2StoredEvent,
@@ -11,6 +13,7 @@ import {
   type ThreadFeedItem,
   type ThreadFeedRequest,
   type ThreadFeedRun,
+  type ThreadFeedUsage,
   type ThreadId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
@@ -21,12 +24,17 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/sql/SqlClient";
 
+import { isQueuedProviderThreadPlaceholder } from "../orchestration-v2/ProjectionStore.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import { EVENT_LOG_PRUNED_THROUGH } from "../persistence/OrchestrationEventStore.ts";
 
 /** Tool input and output are previews; the full text stays readable through `t3 thread show`. */
 const TOOL_TEXT_LIMIT = 4_000;
 const MAX_TAIL_ITEMS = 200;
+/** A provider can report usage many times a second; a reader gets about one line a second. */
+const USAGE_INTERVAL_MS = 1_000;
+/** How far back the newest turn that reported usage is looked for. */
+const USAGE_TURNS_READ = 32;
 
 type FeedEventOf<T extends ThreadFeedEvent["type"]> = Extract<ThreadFeedEvent, { type: T }>;
 
@@ -137,6 +145,32 @@ const toFeedRun = (run: OrchestrationV2Run): ThreadFeedRun => ({
   completedAt: iso(run.completedAt),
 });
 
+const toFeedUsage = (
+  usage: Pick<ThreadFeedUsage, "usedTokens" | "updatedAt"> & {
+    readonly maxTokens?: number | null | undefined;
+    readonly autoCompactThreshold?: number | undefined;
+  },
+): ThreadFeedUsage => ({
+  usedTokens: usage.usedTokens,
+  maxTokens: usage.maxTokens ?? null,
+  ...(usage.autoCompactThreshold === undefined
+    ? {}
+    : { autoCompactThreshold: usage.autoCompactThreshold }),
+  updatedAt: usage.updatedAt,
+});
+
+/** A line is a change when one of these moved; `updatedAt` moves with every report. */
+const usageSignature = (usage: ThreadFeedUsage) =>
+  `${usage.usedTokens}:${usage.maxTokens ?? ""}:${usage.autoCompactThreshold ?? ""}`;
+
+/** Which conversation's usage counts for the thread, and whether its turns report it. */
+interface UsageSeed {
+  readonly activeProviderThreadId: string | null;
+  /** A conversation whose turns report usage is never read from its own `contextUsage`. */
+  readonly turnsReport: boolean;
+  readonly usage: ThreadFeedUsage | null;
+}
+
 type RequestDetail = Pick<
   ThreadFeedRequest,
   "kind" | "questions" | "prompt" | "reason" | "options"
@@ -197,6 +231,15 @@ export const makeThreadFeedTranslator = (threadId: ThreadId) => {
     { request: OrchestrationV2RuntimeRequest; runId: string | null }
   >();
   const emittedRequests = new Map<string, string>();
+  let activeProviderThreadId: string | null = null;
+  let turnsReport = false;
+  /** Until `ready`, usage changes are only counted: the reader gets the newest once. */
+  let usageLive = false;
+  let usageChangedAt: number | undefined;
+  let sentUsage: string | undefined;
+  let lastUsageMs = Number.NEGATIVE_INFINITY;
+  let heldUsage: { usage: ThreadFeedUsage; position: number; atMs: number } | undefined;
+  let lastSequence = 0;
 
   const common = (position: number) => ({ v: THREAD_FEED_VERSION, threadId, position });
 
@@ -250,7 +293,89 @@ export const makeThreadFeedTranslator = (threadId: ThreadId) => {
     return [full, ...requestEvents];
   };
 
+  /** The usage this event reports for the thread's own conversation, never a subagent's. */
+  const usageOf = (event: OrchestrationV2StoredEvent["event"]): ThreadFeedUsage | undefined => {
+    if (event.type === "provider-thread.updated") {
+      const providerThread = event.payload;
+      if (
+        providerThread.appThreadId === threadId &&
+        !isQueuedProviderThreadPlaceholder(providerThread) &&
+        providerThread.id !== activeProviderThreadId
+      ) {
+        activeProviderThreadId = providerThread.id;
+        turnsReport = false;
+      }
+      return providerThread.id === activeProviderThreadId &&
+        !turnsReport &&
+        providerThread.contextUsage != null
+        ? toFeedUsage({
+            ...providerThread.contextUsage,
+            updatedAt: DateTime.formatIso(providerThread.updatedAt),
+          })
+        : undefined;
+    }
+    if (
+      event.type === "provider-turn.updated" &&
+      event.payload.providerThreadId === activeProviderThreadId &&
+      event.payload.tokenUsage !== undefined
+    ) {
+      turnsReport = true;
+      return toFeedUsage(event.payload.tokenUsage);
+    }
+    return undefined;
+  };
+
+  const usageEvent = (usage: ThreadFeedUsage, position: number, atMs: number) => {
+    sentUsage = usageSignature(usage);
+    lastUsageMs = atMs;
+    heldUsage = undefined;
+    return [{ ...common(position), type: "usage", usage } satisfies FeedEventOf<"usage">];
+  };
+
+  const usageEvents = (stored: OrchestrationV2StoredEvent): Array<ThreadFeedEvent> => {
+    const usage = usageOf(stored.event);
+    if (usage === undefined) return [];
+    if (!usageLive) {
+      usageChangedAt = stored.sequence;
+      return [];
+    }
+    const known = heldUsage === undefined ? sentUsage : usageSignature(heldUsage.usage);
+    if (known === usageSignature(usage)) return [];
+    const atMs = DateTime.toEpochMillis(stored.event.occurredAt);
+    if (atMs - lastUsageMs >= USAGE_INTERVAL_MS) return usageEvent(usage, stored.sequence, atMs);
+    heldUsage = { usage, position: stored.sequence, atMs };
+    return [];
+  };
+
   return {
+    /**
+     * What catch-up found: the position of the newest usage change it passed, if any. From here
+     * on usage changes are sent as they happen.
+     */
+    startUsage: (seed: UsageSeed) => {
+      const changedAt = usageChangedAt;
+      usageChangedAt = undefined;
+      activeProviderThreadId = seed.activeProviderThreadId;
+      turnsReport = seed.turnsReport;
+      sentUsage = seed.usage === null ? undefined : usageSignature(seed.usage);
+      usageLive = true;
+      return changedAt;
+    },
+    /** Before catch-up: which conversation's usage to count. */
+    seedUsage: (seed: Pick<UsageSeed, "activeProviderThreadId" | "turnsReport">) => {
+      activeProviderThreadId = seed.activeProviderThreadId;
+      turnsReport = seed.turnsReport;
+    },
+    /** The usage held back to keep to one line a second, once it is due. Positions never go back. */
+    flushUsage: (): Array<ThreadFeedEvent> => {
+      if (heldUsage === undefined) return [];
+      const { usage, position, atMs } = heldUsage;
+      if (usageSignature(usage) === sentUsage) {
+        heldUsage = undefined;
+        return [];
+      }
+      return usageEvent(usage, Math.max(position, lastSequence), atMs);
+    },
     /** A pending request this event opens whose question or approval item is not known yet. */
     missingDetail: (stored: OrchestrationV2StoredEvent) =>
       stored.event.type === "runtime-request.updated" &&
@@ -279,6 +404,7 @@ export const makeThreadFeedTranslator = (threadId: ThreadId) => {
     translate: (stored: OrchestrationV2StoredEvent): Array<ThreadFeedEvent> => {
       const { event, sequence } = stored;
       if (event.threadId !== threadId) return [];
+      lastSequence = Math.max(lastSequence, sequence);
       switch (event.type) {
         case "turn-item.updated":
           return itemEvents(event.payload, sequence);
@@ -292,6 +418,9 @@ export const makeThreadFeedTranslator = (threadId: ThreadId) => {
         case "runtime-request.updated":
           requests.set(event.payload.id, { request: event.payload, runId: event.runId ?? null });
           return requestEvent(event.payload.id, sequence);
+        case "provider-thread.updated":
+        case "provider-turn.updated":
+          return usageEvents(stored);
         default:
           return [];
       }
@@ -304,6 +433,12 @@ const decodeRequest = Schema.decodeUnknownEffect(
   Schema.fromJsonString(OrchestrationV2RuntimeRequestJson),
 );
 const decodeItem = Schema.decodeUnknownEffect(Schema.fromJsonString(OrchestrationV2TurnItemJson));
+const decodeTurnUsage = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(OrchestrationV2ProviderTurnTokenUsage),
+);
+const decodeContextUsage = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(ThreadTokenUsageSnapshot),
+);
 
 export interface ThreadFeedFollowInput {
   readonly threadId: ThreadId;
@@ -376,9 +511,50 @@ export const make = Effect.fn("ThreadFeed.make")(function* (source: ThreadFeedSo
     Effect.map((rows) => rows[0]?.last_sequence ?? 0),
   );
 
+  // The usage T3's window shows: the newest report among the active conversation's turns, else
+  // that conversation's own. The turns are read from the newest through their
+  // (provider_thread_id, ordinal) index, a fixed number of them however long the thread is.
+  const readUsage = Effect.fn("ThreadFeed.readUsage")(function* (
+    activeProviderThreadId: string | null,
+  ) {
+    if (activeProviderThreadId === null) return { turnsReport: false, usage: null };
+    const turnRows = yield* sql<{ usage: string }>`
+      SELECT usage FROM (
+        SELECT json_extract(payload_json, '$.tokenUsage') AS usage, ordinal
+        FROM orchestration_v2_projection_provider_turns
+        WHERE provider_thread_id = ${activeProviderThreadId}
+        ORDER BY ordinal DESC
+        LIMIT ${USAGE_TURNS_READ}
+      )
+      WHERE usage IS NOT NULL
+      ORDER BY ordinal ASC`;
+    let latest: ThreadFeedUsage | null = null;
+    for (const row of turnRows) {
+      const usage = yield* decodeTurnUsage(row.usage);
+      // Ties go to the later turn, as in the window's own pick.
+      if (latest === null || Date.parse(usage.updatedAt) >= Date.parse(latest.updatedAt)) {
+        latest = toFeedUsage(usage);
+      }
+    }
+    if (latest !== null) return { turnsReport: true, usage: latest };
+    const threadRows = yield* sql<{ usage: string | null; updated_at: string }>`
+      SELECT json_extract(payload_json, '$.contextUsage') AS usage, updated_at
+      FROM orchestration_v2_projection_provider_threads
+      WHERE provider_thread_id = ${activeProviderThreadId}`;
+    const row = threadRows[0];
+    if (row === undefined || row.usage === null) return { turnsReport: false, usage: null };
+    const usage = yield* decodeContextUsage(row.usage);
+    return { turnsReport: false, usage: toFeedUsage({ ...usage, updatedAt: row.updated_at }) };
+  });
+
   const readState = Effect.fn("ThreadFeed.readState")(function* (threadId: ThreadId) {
-    const threadRows = yield* sql<{ title: string; archived_at: string | null }>`
-      SELECT title, archived_at FROM orchestration_v2_projection_threads
+    const threadRows = yield* sql<{
+      title: string;
+      archived_at: string | null;
+      active_provider_thread_id: string | null;
+    }>`
+      SELECT title, archived_at, active_provider_thread_id
+      FROM orchestration_v2_projection_threads
       WHERE thread_id = ${threadId} AND deleted_at IS NULL`;
     const thread = threadRows[0];
     if (thread === undefined) return null;
@@ -412,6 +588,10 @@ export const make = Effect.fn("ThreadFeed.make")(function* (source: ThreadFeedSo
       },
       run,
       requests,
+      usage: {
+        activeProviderThreadId: thread.active_provider_thread_id,
+        ...(yield* readUsage(thread.active_provider_thread_id)),
+      },
     };
   });
 
@@ -442,6 +622,7 @@ export const make = Effect.fn("ThreadFeed.make")(function* (source: ThreadFeedSo
         const translator = makeThreadFeedTranslator(threadId);
         const tailItems = after === undefined ? yield* readTail(threadId, tail) : [];
         translator.seed({ items: tailItems });
+        translator.seedUsage(initial.usage);
         const tailEvents = tailItems.map((item): ThreadFeedEvent => ({
           v: THREAD_FEED_VERSION,
           type: "item",
@@ -457,6 +638,20 @@ export const make = Effect.fn("ThreadFeed.make")(function* (source: ThreadFeedSo
             ...(state.run === null ? {} : { runs: [state.run] }),
             requests: state.requests,
           });
+          // A resume that passed usage changes gets the newest once, not each one in between.
+          const usageChangedAt = translator.startUsage(state.usage);
+          const usage: Array<ThreadFeedEvent> =
+            usageChangedAt === undefined || state.usage.usage === null
+              ? []
+              : [
+                  {
+                    v: THREAD_FEED_VERSION,
+                    type: "usage",
+                    threadId,
+                    position: usageChangedAt,
+                    usage: state.usage.usage,
+                  },
+                ];
           const ready: ThreadFeedEvent = {
             v: THREAD_FEED_VERSION,
             type: "ready",
@@ -465,8 +660,9 @@ export const make = Effect.fn("ThreadFeed.make")(function* (source: ThreadFeedSo
             thread: state.thread,
             run: state.run === null ? null : toFeedRun(state.run),
             requests: state.requests.map((entry) => entry.feed),
+            usage: state.usage.usage,
           };
-          return [ready];
+          return [...usage, ready];
         });
         const start = after ?? head;
         const caughtUp = start >= head;
@@ -487,8 +683,13 @@ export const make = Effect.fn("ThreadFeed.make")(function* (source: ThreadFeedSo
           ),
           Stream.flattenIterable,
         );
+        // A change held back to keep to one line a second goes out by itself, with no later event.
+        const heldUsage = Stream.tick(USAGE_INTERVAL_MS).pipe(
+          Stream.map(() => translator.flushUsage()),
+          Stream.flattenIterable,
+        );
         return Stream.fromIterable([...tailEvents, ...initialReady]).pipe(
-          Stream.concat(translated),
+          Stream.concat(translated.pipe(Stream.merge(heldUsage, { haltStrategy: "left" }))),
         );
       }),
     );

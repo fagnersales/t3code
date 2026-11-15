@@ -851,7 +851,9 @@ export function emptyProjection(
   };
 }
 
-function isQueuedProviderThreadPlaceholder(providerThread: OrchestrationV2ProviderThread): boolean {
+export function isQueuedProviderThreadPlaceholder(
+  providerThread: OrchestrationV2ProviderThread,
+): boolean {
   return (
     providerThread.status === "not_loaded" &&
     providerThread.firstRunOrdinal === null &&

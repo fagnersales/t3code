@@ -15,6 +15,8 @@ import {
   commandItem,
   layerFeedOn,
   NodeId,
+  providerThread,
+  providerTurn,
   questionItem,
   run,
   RuntimeRequestId,
@@ -59,6 +61,8 @@ const summary = (event: ThreadFeedEvent) => {
       return `run ${event.run.status}`;
     case "request":
       return `request ${event.request.kind} ${event.request.state}`;
+    case "usage":
+      return `usage ${event.usage.usedTokens}/${event.usage.maxTokens ?? "?"}`;
     default:
       return event.type;
   }
@@ -265,6 +269,138 @@ layer("ThreadFeed", (it) => {
     ),
   );
 
+  it.effect("sends the thread's usage in ready, then a line for each change", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const now = yield* DateTime.now;
+        const threadId = yield* seedThread("Usage");
+        const conversation = providerThread(threadId, "main", now);
+        const usage = { usedTokens: 412_000, maxTokens: 1_000_000, autoCompactThreshold: 835_000 };
+        yield* writeEvents(threadId, [
+          { type: "provider-thread.updated", payload: conversation },
+          { type: "provider-turn.updated", payload: providerTurn(conversation, 1, now, usage) },
+        ]);
+
+        const events = yield* follow({ threadId });
+        const [ready] = yield* takeThrough(events, "ready");
+        assert.deepEqual(ready?.type === "ready" ? ready.usage : undefined, {
+          ...usage,
+          updatedAt: DateTime.formatIso(now),
+        });
+
+        // A subagent's turn and a report that repeats the numbers are no change.
+        const subagent = providerThread(threadId, "subagent", now, {
+          ownerNodeId: NodeId.make(`${threadId}:subagent-node`),
+        });
+        const later = DateTime.add(now, { seconds: 5 });
+        const position = yield* writeEvents(threadId, [
+          { type: "provider-thread.updated", payload: subagent },
+          {
+            type: "provider-turn.updated",
+            payload: providerTurn(subagent, 1, later, { usedTokens: 9_000, maxTokens: 200_000 }),
+          },
+          { type: "provider-turn.updated", payload: providerTurn(conversation, 1, later, usage) },
+          {
+            type: "provider-turn.updated",
+            payload: providerTurn(conversation, 2, later, { usedTokens: 30_000, maxTokens: null }),
+          },
+        ]);
+        const line = yield* Queue.take(events);
+        assert.deepEqual(line, {
+          v: 1,
+          type: "usage",
+          threadId,
+          position,
+          usage: { usedTokens: 30_000, maxTokens: null, updatedAt: DateTime.formatIso(later) },
+        });
+      }),
+    ),
+  );
+
+  it.effect("a resume gets the newest usage once, and none when it did not change", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const now = yield* DateTime.now;
+        const threadId = yield* seedThread("Usage resume");
+        const conversation = providerThread(threadId, "main", now);
+        const position = yield* writeEvents(threadId, [
+          { type: "provider-thread.updated", payload: conversation },
+          {
+            type: "provider-turn.updated",
+            payload: providerTurn(conversation, 1, now, { usedTokens: 100, maxTokens: 1_000 }),
+          },
+        ]);
+        const unchanged = yield* takeThrough(yield* follow({ threadId, after: position }), "ready");
+        assert.deepEqual(unchanged.map(summary), ["ready"]);
+
+        yield* writeEvents(threadId, [
+          {
+            type: "provider-turn.updated",
+            payload: providerTurn(conversation, 1, now, { usedTokens: 200, maxTokens: 1_000 }),
+          },
+        ]);
+        const newest = yield* writeEvents(threadId, [
+          {
+            type: "provider-turn.updated",
+            payload: providerTurn(conversation, 2, now, { usedTokens: 300, maxTokens: 1_000 }),
+          },
+        ]);
+        yield* writeEvents(threadId, [
+          { type: "turn-item.updated", payload: userMessage(threadId, 0, "after", now) },
+        ]);
+        const resumed = yield* takeThrough(yield* follow({ threadId, after: position }), "ready");
+        assert.deepEqual(resumed.map(summary), [
+          "item user_message completed after",
+          "usage 300/1000",
+          "ready",
+        ]);
+        const line = resumed[1];
+        assert.equal(line?.type === "usage" ? line.position : null, newest);
+        const ready = resumed.at(-1);
+        assert.equal(ready?.type === "ready" ? ready.usage?.usedTokens : null, 300);
+      }),
+    ),
+  );
+
+  it.effect("a conversation whose turns report none gives its own usage, or null", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const now = yield* DateTime.now;
+        const threadId = yield* seedThread("Usage of a conversation");
+        const empty = yield* takeThrough(yield* follow({ threadId }), "ready");
+        assert.isNull(empty[0]?.type === "ready" ? empty[0].usage : undefined);
+
+        const conversation = providerThread(threadId, "main", now, {
+          contextUsage: { usedTokens: 5_000, maxTokens: 128_000 },
+        });
+        yield* writeEvents(threadId, [
+          { type: "provider-thread.updated", payload: conversation },
+          { type: "provider-turn.updated", payload: providerTurn(conversation, 1, now) },
+        ]);
+        const events = yield* follow({ threadId });
+        const [ready] = yield* takeThrough(events, "ready");
+        assert.deepEqual(ready?.type === "ready" ? ready.usage : undefined, {
+          usedTokens: 5_000,
+          maxTokens: 128_000,
+          updatedAt: DateTime.formatIso(now),
+        });
+
+        const later = DateTime.add(now, { seconds: 5 });
+        yield* writeEvents(threadId, [
+          {
+            type: "provider-thread.updated",
+            payload: {
+              ...conversation,
+              contextUsage: { usedTokens: 7_500, maxTokens: 128_000 },
+              updatedAt: later,
+            },
+          },
+        ]);
+        assert.equal(summary(yield* Queue.take(events)), "usage 7500/128000");
+      }),
+    ),
+  );
+
   it.effect("an unknown thread ends its feed with an error", () =>
     Effect.gen(function* () {
       const feed = yield* ThreadFeed.ThreadFeed;
@@ -302,4 +438,41 @@ it("a streaming item that rewrites its text is sent whole instead of as a delta"
   assert.deepEqual(translator.translate(stored(3, "Final")).map(summary), [
     "item assistant_message running Final",
   ]);
+});
+
+it("usage reported many times a second is one line a second, and the last one always goes", () => {
+  const threadId = ThreadId.make("thread-usage-burst");
+  const translator = ThreadFeed.makeThreadFeedTranslator(threadId);
+  const conversation = providerThread(threadId, "main", DateTime.makeUnsafe(0));
+  translator.startUsage({
+    activeProviderThreadId: conversation.id,
+    turnsReport: true,
+    usage: null,
+  });
+  const report = (sequence: number, atMs: number, usedTokens: number) => {
+    const at = DateTime.makeUnsafe(atMs);
+    return translator
+      .translate({
+        sequence,
+        commandId: null,
+        event: {
+          id: `event-${sequence}`,
+          type: "provider-turn.updated",
+          threadId,
+          occurredAt: at,
+          payload: providerTurn(conversation, 1, at, { usedTokens, maxTokens: 1_000 }),
+        },
+      } as unknown as Parameters<typeof translator.translate>[0])
+      .map(summary);
+  };
+  assert.deepEqual(report(1, 10_000, 100), ["usage 100/1000"]);
+  assert.deepEqual(report(2, 10_200, 200), []);
+  assert.deepEqual(report(3, 10_400, 300), []);
+  // The change held back goes out by itself, at the newest position sent, never an older one.
+  const held = translator.flushUsage();
+  assert.deepEqual(held.map(summary), ["usage 300/1000"]);
+  assert.equal(held[0]?.type === "usage" ? held[0].position : null, 3);
+  assert.deepEqual(translator.flushUsage(), []);
+  assert.deepEqual(report(4, 10_500, 300), []);
+  assert.deepEqual(report(5, 11_500, 400), ["usage 400/1000"]);
 });
