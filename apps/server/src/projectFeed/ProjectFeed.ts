@@ -149,6 +149,7 @@ const toFeedThread = (
     creationSource: shell.creationSource,
     providerInstanceId: shell.modelSelection.instanceId,
     model: shell.modelSelection.model,
+    modelOptions: shell.modelSelection.options ?? [],
     branch: shell.branch,
     worktreePath: shell.worktreePath,
     createdAt: DateTime.formatIso(shell.createdAt),
@@ -187,7 +188,11 @@ export const diffThreads = (
     changes.push("parent");
   }
   if (previous.launchedByThreadId !== next.launchedByThreadId) changes.push("launcher");
-  if (previous.model !== next.model || previous.providerInstanceId !== next.providerInstanceId) {
+  if (
+    previous.model !== next.model ||
+    previous.providerInstanceId !== next.providerInstanceId ||
+    !sameJson(previous.modelOptions, next.modelOptions)
+  ) {
     changes.push("model");
   }
   if (previous.branch !== next.branch) changes.push("branch");
