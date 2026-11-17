@@ -388,6 +388,7 @@ it.effect("diffThreads names the fields a reader acts on, never updatedAt alone"
       creationSource: "web",
       providerInstanceId: "codex",
       model: "gpt",
+      modelOptions: [],
       branch: null,
       worktreePath: null,
       createdAt: "2026-11-09T00:00:00.000Z",
@@ -404,6 +405,13 @@ it.effect("diffThreads names the fields a reader acts on, never updatedAt alone"
         launchedByThreadId: "lead",
       }),
       ["title", "snoozed", "launcher", "branch", "worktree"],
+    );
+    assert.deepEqual(
+      ProjectFeed.diffThreads(base, {
+        ...base,
+        modelOptions: [{ id: "effort", value: "medium" }],
+      }),
+      ["model"],
     );
   }),
 );

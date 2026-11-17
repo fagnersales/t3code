@@ -38,6 +38,10 @@ Fagner's T3 Code: the Nightly he ran, plus live thread and project feeds for Hea
 - **Start effort:** `t3 thread start --provider P --model M --effort medium` starts the thread
   with the model's `effort` option set, as the model picker does. Headquarters passes the effort
   its Settings chose.
+- **Model options in the project feed:** each thread line carries `modelOptions` (the effort and
+  the model's other options), and a change of them is a `model` change. Headquarters reads them
+  to keep every thread it follows on the model and effort its Settings chose, which it sets with
+  T3's own `thread.model-selection.set` command over `/ws`.
 - **Build identity:** versions `<nightly>-fagner.N`, app name `T3 Code (Fagner)`, no update feed
   (the updater reports updates as unavailable, so nothing can replace it with upstream).
 

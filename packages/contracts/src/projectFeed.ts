@@ -1,5 +1,6 @@
 import * as Schema from "effect/Schema";
 
+import { ProviderOptionSelection } from "./model.ts";
 import { OrchestrationV2RunStatus } from "./orchestrationV2.ts";
 
 /**
@@ -64,6 +65,8 @@ export const ProjectFeedThread = Schema.Struct({
   creationSource: Schema.String,
   providerInstanceId: Schema.String,
   model: Schema.String,
+  /** The model's options as the thread holds them (`effort`, `fastMode`, …); empty when it sets none. */
+  modelOptions: Schema.Array(ProviderOptionSelection),
   branch: Schema.NullOr(Schema.String),
   worktreePath: Schema.NullOr(Schema.String),
   createdAt: Schema.String,
